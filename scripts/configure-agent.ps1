@@ -8,7 +8,10 @@ param(
     [switch]$RequireClientCert = $true,
     # Разрешать доступ учётке, входящей в локальную группу Administrators этой машины,
     # даже если она не состоит в AllowedGroups. По умолчанию включено.
-    [bool]$AllowLocalAdmins = $true
+    [bool]$AllowLocalAdmins = $true,
+    # Разрешать доступ ЛЮБОМУ включённому пользователю домена (учётка есть в AD).
+    # По умолчанию выключено: включать осознанно.
+    [bool]$AllowDomainUsers = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,17 +26,21 @@ New-ItemProperty -Path $key -Name "ListenPort" -PropertyType DWord -Value $Liste
 $requireCertValue = if ($RequireClientCert.IsPresent) { 1 } else { 0 }
 New-ItemProperty -Path $key -Name "RequireClientCert" -PropertyType DWord -Value $requireCertValue -Force | Out-Null
 New-ItemProperty -Path $key -Name "AllowLocalAdmins" -PropertyType DWord -Value ([int]$AllowLocalAdmins) -Force | Out-Null
+New-ItemProperty -Path $key -Name "AllowDomainUsers" -PropertyType DWord -Value ([int]$AllowDomainUsers) -Force | Out-Null
 Write-Host "AllowLocalAdmins: $AllowLocalAdmins"
+Write-Host "AllowDomainUsers: $AllowDomainUsers"
 
 if ($AllowedGroups.Count -gt 0) {
     New-ItemProperty -Path $key -Name "AllowedGroups" -PropertyType MultiString -Value $AllowedGroups -Force | Out-Null
     Write-Host "AllowedGroups: $($AllowedGroups -join ', ')"
 } else {
     Remove-ItemProperty -Path $key -Name "AllowedGroups" -ErrorAction SilentlyContinue
-    if ($AllowLocalAdmins) {
+    if ($AllowDomainUsers) {
+        Write-Host "AllowedGroups не задан, AllowDomainUsers=1 — доступ разрешён любому доменному пользователю."
+    } elseif ($AllowLocalAdmins) {
         Write-Host "AllowedGroups не задан — доступ только локальным администраторам машины (AllowLocalAdmins=1)."
     } else {
-        Write-Host "AllowedGroups не задан, AllowLocalAdmins=0 — доступ разрешён любому сертификату домена (НЕ для продакшена)."
+        Write-Host "Все правила выключены — доступ разрешён любому сертификату домена (НЕ для продакшена)."
     }
 }
 

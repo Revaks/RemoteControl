@@ -20,6 +20,10 @@
 // группу Administrators этой машины (даже если её нет в AllowedGroups или в AD).
 // По умолчанию (значение отсутствует) — включено.
 #define RC_REG_VALUE_ALLOW_LOCAL_ADMINS L"AllowLocalAdmins"
+// DWORD, 1 = доступ разрешён любому пользователю домена: достаточно, чтобы UPN из
+// клиентского сертификата соответствовал включённой учётной записи в AD (без проверки
+// групп). По умолчанию (значение отсутствует) — выключено.
+#define RC_REG_VALUE_ALLOW_DOMAIN_USERS L"AllowDomainUsers"
 
 // Мьютекс одиночного экземпляра службы
 #define RC_SERVICE_MUTEX_NAME          L"Global\\RemoteControlAgent.ServiceMutex"

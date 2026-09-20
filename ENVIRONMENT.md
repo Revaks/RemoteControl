@@ -129,6 +129,44 @@ sc.exe stop RemoteControlAgent; sc.exe start RemoteControlAgent
 
 ---
 
+## 5.1. Мини-CA и автоенроллмент (`tools/labca`)
+
+Дополнительно к `labcerts` (ручной стенд) в репозитории есть мини-CA для автоматического выпуска
+сертификатов: `tools/labca` (ЦС), `scripts/enroll-cert.ps1` (клиент), `scripts/setup-autoenroll-gpo.ps1` (GPO).
+
+Развёртывание ЦС на DC1:
+
+```powershell
+& C:\dotnet\dotnet.exe build C:\Projects\RemoteControl\tools\labca\labca.csproj -c Release -o C:\Projects\RemoteControl\tools\labca\out
+netsh http add urlacl url=http://+:80/ user=SYSTEM
+netsh http add urlacl url=http://+:8555/ user=SYSTEM
+schtasks /create /tn RemoteControlLabCa /tr "C:\dotnet\dotnet.exe C:\Projects\RemoteControl\tools\labca\out\labca.dll" /sc onstart /ru SYSTEM /rl HIGHEST /f
+schtasks /run /tn RemoteControlLabCa
+New-NetFirewallRule -DisplayName 'RemoteControl Lab CA (TCP 80)'   -Direction Inbound -Protocol TCP -LocalPort 80   -Action Allow
+New-NetFirewallRule -DisplayName 'RemoteControl Lab CA (TCP 8555)' -Direction Inbound -Protocol TCP -LocalPort 8555 -Action Allow
+```
+
+Корень: `CN=RemoteControl Lab CA`; журнал — `C:\Setup\labca\labca.log`. Эндпоинты:
+`http://dc1.corp.local/ca.cer`, `/ca.crl` — анонимно (CRL обязан быть без аутентификации, иначе
+проверка отзыва не работает), `http://dc1.corp.local:8555/enroll` — Negotiate/NTLM + подпись PKCS#10.
+Автоенроллмент: `scripts/setup-autoenroll-gpo.ps1` (startup-скрипт для машин, logon — для пользователей).
+
+**Грабли GPO-скриптов (на которые наступили):**
+- клиент берёт extension names **из атрибутов AD** `gPCMachineExtensionNames`/`gPCUserExtensionNames`
+  объекта GPO, а не из gpt.ini; без них Scripts CSE вообще не запускается;
+- правильная пара GUID для Scripts: CSE `{42B5FAAE-6536-11D2-AE5A-0000F87571E3}` (`gpscript.dll`) +
+  tool `{42B5FAAE-6536-11D1-AE54-0000F80367C1}`; старый `...11D1-AE54...` в роли CSE не работает;
+- `New-GPO` оставляет `versionNumber=0` — при ручной правке SYSVOL версию у AD-объекта GPO надо
+  поднимать (иначе клиент не перечитывает), а gpt.ini держать в соответствии;
+- `scripts.ini` лежит в `Machine\Scripts\scripts.ini` (секция `[Startup]`) и `User\Scripts\scripts.ini`
+  (секция `[Logon]`); сами файлы — в `Machine\Scripts\Startup\` и `User\Scripts\Logon\`;
+- startup-скрипт выполняется только при загрузке, logon — при входе (не при `gpupdate`).
+
+Проверка (20.09.2026): у win11-host удалили машинный сертификат и перезагрузили — GPO startup-скрипт
+сам выпустил `CN=WIN11HOST.corp.local` от мини-CA (`C:\ProgramData\RemoteControl\enroll-machine.log`).
+
+---
+
 ## 6. Агент (C, Schannel + LibVNCServer)
 
 Исходники: `/home/UCBerkeley/Projects/RemoteControl/src/Agent` (хост) = `C:\Projects\RemoteControl\src\Agent` (VM).

@@ -186,6 +186,24 @@ static int is_local_admin(const wchar_t* upn)
     return found;
 }
 
+// Читает DWORD AllowDomainUsers. Значение отсутствует — правило выключено.
+static int read_allow_domain_users(void)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, RC_REG_PARAMETERS_KEY, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return 0;
+
+    DWORD value = 0, size = sizeof(value), type = 0;
+    if (RegQueryValueExW(key, RC_REG_VALUE_ALLOW_DOMAIN_USERS, NULL, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+    {
+        value = 0;
+    }
+
+    RegCloseKey(key);
+    return value != 0;
+}
+
 // ---------- основная проверка ----------
 
 int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLen)
@@ -212,13 +230,19 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
     wcsncpy_s(upn, upnLen, tmp, _TRUNCATE);
     free(tmp);
 
-    // 2. Правила доступа: список разрешённых групп AD + правило локального админа.
+    // 2. Правила доступа (достаточно любого включённого):
+    //    - AllowedGroups    — членство в перечисленных группах AD (LDAP);
+    //    - AllowDomainUsers — любой включённый пользователь домена (учётка найдена в AD);
+    //    - AllowLocalAdmins — учётка входит в локальную группу Administrators этой машины.
     int allowLocalAdmins = read_allow_local_admins();
+    int allowDomainUsers = read_allow_domain_users();
     wchar_t* groups = read_allowed_groups();
-    if (groups == NULL || groups[0] == L'\0')
+    int haveGroupRule = (groups != NULL && groups[0] != L'\0');
+
+    if (!haveGroupRule && !allowDomainUsers)
     {
-        // AllowedGroups не задан. Если правило локальных админов включено —
-        // доступ получают только локальные администраторы этой машины.
+        // Ни групп, ни правила «любой доменный пользователь»: проверка не выходит за
+        // пределы этой машины — локальные администраторы либо прежнее поведение.
         if (allowLocalAdmins)
         {
             if (is_local_admin(upn))
@@ -235,10 +259,10 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
             return -1;
         }
 
-        // Правило локальных админов выключено и группы не заданы — прежнее поведение
-        // (доступ по факту предъявления сертификата домена). Для продакшена не рекомендуется.
+        // Все правила выключены — прежнее поведение (доступ по факту предъявления
+        // сертификата домена). Для продакшена не рекомендуется.
         rc_event_log(EVENTLOG_WARNING_TYPE, 1201,
-            L"AllowedGroups не настроен — доступ разрешён любому сертификату домена. UPN=%s", upn);
+            L"Правила не настроены — доступ разрешён любому сертификату домена. UPN=%s", upn);
         free(groups);
         return 0;
     }
@@ -338,7 +362,7 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
         swprintf_s(filter, _countof(filter),
             L"(&(objectClass=user)(userPrincipalName=%s))", escUpn);
 
-        wchar_t* attrs[] = { L"distinguishedName", NULL };
+        wchar_t* attrs[] = { L"distinguishedName", L"userAccountControl", NULL };
         LDAPMessage* res = NULL;
         ULONG src = ldap_search_sW(ld, (PWCHAR)baseDn, LDAP_SCOPE_SUBTREE, filter, attrs, 0, &res);
         if (src != LDAP_SUCCESS)
@@ -367,25 +391,53 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
             goto cleanup;
         }
 
-        wchar_t* userDn = ldap_get_dnW(ld, entry);
-
-        // Проверяем членство для каждой разрешённой группы.
-        const wchar_t* g = groups;
-        while (*g != L'\0')
+        // Отключённую учётную запись не пускаем ни по одному правилу.
         {
-            int found = check_group_membership(ld, baseDn, userDn, g);
-            if (found == 1)
+            wchar_t** uac = ldap_get_valuesW(ld, entry, L"userAccountControl");
+            if (uac != NULL)
             {
-                result = 0;
-                rc_event_log(EVENTLOG_INFORMATION_TYPE, 1204,
-                    L"Доступ разрешён: UPN=%s, группа=%s", upn, g);
-                break;
+                unsigned long flags = (unsigned long)_wtoi(uac[0]);
+                ldap_value_freeW(uac);
+                if ((flags & 2) != 0) // UF_ACCOUNTDISABLE
+                {
+                    rc_event_log(EVENTLOG_WARNING_TYPE, 1216,
+                        L"Доступ запрещён: учётная запись отключена в AD. UPN=%s", upn);
+                    ldap_msgfree(res);
+                    goto cleanup;
+                }
             }
-            g += wcslen(g) + 1;
         }
 
-        // Альтернатива AD-группе: доменный пользователь, который входит в локальную
-        // группу Administrators этой машины (правило AllowLocalAdmins, включено по умолчанию).
+        wchar_t* userDn = ldap_get_dnW(ld, entry);
+
+        // Проверяем членство для каждой разрешённой группы (если список задан).
+        if (haveGroupRule)
+        {
+            const wchar_t* g = groups;
+            while (*g != L'\0')
+            {
+                int found = check_group_membership(ld, baseDn, userDn, g);
+                if (found == 1)
+                {
+                    result = 0;
+                    rc_event_log(EVENTLOG_INFORMATION_TYPE, 1204,
+                        L"Доступ разрешён: UPN=%s, группа=%s", upn, g);
+                    break;
+                }
+                g += wcslen(g) + 1;
+            }
+        }
+
+        // Правило AllowDomainUsers: учётка есть в AD — этого достаточно.
+        if (result != 0 && allowDomainUsers)
+        {
+            result = 0;
+            rc_event_log(EVENTLOG_INFORMATION_TYPE, 1215,
+                L"Доступ разрешён: UPN=%s, доменный пользователь (AllowDomainUsers)", upn);
+        }
+
+        // Альтернатива: доменный пользователь, который входит в локальную группу
+        // Administrators этой машины (правило AllowLocalAdmins).
         if (result != 0 && allowLocalAdmins && is_local_admin(upn))
         {
             result = 0;
