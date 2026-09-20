@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>RemoteControl.Core</RootNamespace>
+    <AssemblyName>RemoteControl.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.DirectoryServices работает только на Windows (как и всё решение) -->
+    <PackageReference Include="System.DirectoryServices" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

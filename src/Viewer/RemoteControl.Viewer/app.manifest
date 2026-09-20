@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Поддержка высокого DPI в консоли оператора -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- TLS 1.3 доступен на Win11/Server2022; на старых системах Schannel сам откатится на TLS 1.2 -->
+    </windowsSettings>
+  </application>
+</assembly>

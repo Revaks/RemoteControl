@@ -1,0 +1,38 @@
+# Build outputs
+bin/
+obj/
+out/
+build/
+dist/
+*.user
+*.suo
+*.nupkg
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.aps
+*.pdb
+*.ipch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.vcxproj
+*.vcxproj.filters
+*.sln.cmake
+
+# Agent binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.sys
+
+# Certificates / secrets — НИКОГДА не коммитить
+*.pfx
+*.p12
+*.key
+*.crt.local
+certs/

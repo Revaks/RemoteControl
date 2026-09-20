@@ -1,0 +1,75 @@
+<Window x:Class="RemoteControl.Viewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Remote Control — консоль оператора"
+        Height="720" Width="1120"
+        WindowStartupLocation="CenterScreen"
+        PreviewKeyDown="MainWindow_PreviewKeyDown"
+        PreviewKeyUp="MainWindow_PreviewKeyUp">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="300" MinWidth="180"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*" MinWidth="400"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Левая панель: компьютеры домена -->
+        <DockPanel Grid.Column="0" Margin="6">
+            <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                <Button x:Name="RefreshButton" DockPanel.Dock="Right" Content="Обновить"
+                        Width="76" Margin="4,0,0,0" Click="RefreshButton_Click"/>
+                <TextBox x:Name="SearchBox" TextChanged="SearchBox_TextChanged"
+                         VerticalContentAlignment="Center" ToolTip="Поиск по имени компьютера"/>
+            </DockPanel>
+            <ListView x:Name="ComputerList"
+                      SelectionChanged="ComputerList_SelectionChanged"
+                      MouseDoubleClick="ComputerList_MouseDoubleClick">
+                <ListView.View>
+                    <GridView>
+                        <GridViewColumn Header="Имя" Width="130" DisplayMemberBinding="{Binding Name}"/>
+                        <GridViewColumn Header="ОС" Width="150" DisplayMemberBinding="{Binding OperatingSystem}"/>
+                    </GridView>
+                </ListView.View>
+            </ListView>
+        </DockPanel>
+
+        <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Center" VerticalAlignment="Stretch"
+                      Background="LightGray" ShowsPreview="True"/>
+
+        <!-- Правая панель: подключение и экран -->
+        <DockPanel Grid.Column="2" Margin="6">
+            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                <TextBlock Text="Компьютер:" VerticalAlignment="Center"/>
+                <TextBox x:Name="HostBox" Width="220" Margin="6,0,8,0"
+                         VerticalContentAlignment="Center"
+                         KeyDown="HostBox_KeyDown"/>
+                <CheckBox x:Name="PushCheck" Content="Push-агент" IsChecked="True"
+                          VerticalAlignment="Center" Margin="0,0,8,0"
+                          ToolTip="Скопировать и запустить агент через ADMIN$ (как DameWare)"/>
+                <Button x:Name="ConnectButton" Content="Подключить" Width="100"
+                        Click="ConnectButton_Click"/>
+                <Button x:Name="DisconnectButton" Content="Отключить" Width="90"
+                        IsEnabled="False" Margin="6,0,0,0" Click="DisconnectButton_Click"/>
+            </StackPanel>
+
+            <StatusBar DockPanel.Dock="Bottom">
+                <StatusBarItem>
+                    <TextBlock x:Name="StatusText" Text="Готов"/>
+                </StatusBarItem>
+                <StatusBarItem HorizontalAlignment="Right">
+                    <TextBlock x:Name="ResolutionText" Text=""/>
+                </StatusBarItem>
+            </StatusBar>
+
+            <Border x:Name="ScreenHost" Background="Black"
+                    Focusable="True"
+                    PreviewMouseDown="ScreenHost_PreviewMouseDown"
+                    PreviewMouseMove="ScreenHost_PreviewMouseMove"
+                    PreviewMouseUp="ScreenHost_PreviewMouseUp"
+                    PreviewMouseWheel="ScreenHost_PreviewMouseWheel"
+                    Cursor="Cross">
+                <Image x:Name="ScreenImage" Stretch="Uniform" SnapsToDevicePixels="True"/>
+            </Border>
+        </DockPanel>
+    </Grid>
+</Window>
