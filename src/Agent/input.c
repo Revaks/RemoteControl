@@ -1,7 +1,102 @@
 #include <windows.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <rfb/rfb.h>
 #include "input.h"
+
+// Отладочный лог ввода (разбираем «клавиша не дошла»). Включён, только если
+// существует маркер C:\Windows\Temp\rc-input.enable — иначе на каждое нажатие
+// шла бы запись в файл (это дорого и бьёт по таймингу инъекции).
+static int input_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = (GetFileAttributesA("C:\\Windows\\Temp\\rc-input.enable") != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+    return enabled;
+}
+
+static void input_trace(const char *fmt, ...)
+{
+    if (!input_trace_enabled())
+        return;
+
+    FILE *f = fopen("C:\\Windows\\Temp\\rc-input.log", "a");
+    if (f == NULL)
+        return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// Secure Attention Sequence (Ctrl+Alt+Del на удалённом столе).
+// SendInput сгенерировать её не может — Windows блокирует SAS из пользовательского
+// режима. Нужен экспорт SendSAS из sas.dll; он доступен процессу-службе, а наш
+// helper запускается службой как SYSTEM в консольной сессии. Viewer присылает
+// keysym 0xFFFFFF00 (см. MainWindow.SasKeysym).
+// ---------------------------------------------------------------------------
+#define SAS_KEYSYM 0xFFFFFF00
+
+// Настоящая сигнатура: void WINAPI SendSAS(BOOL AsUser) — ошибку смотрим в GetLastError.
+typedef void (WINAPI *send_sas_fn)(BOOL asUser);
+
+// SendSAS(FALSE) требует включённой привилегии SeTcbPrivilege в токене процесса
+// (в SYSTEM-токене она есть, но по умолчанию отключена). Иначе функция тихо
+// ничего не делает — SAS не появляется.
+static void enable_tcb_privilege(void)
+{
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return;
+
+    LUID luid;
+    if (LookupPrivilegeValueW(NULL, SE_TCB_NAME, &luid))
+    {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL);
+        input_trace("SAS: AdjustTokenPrivileges(SeTcb) ok=%d err=%lu", (int)ok, GetLastError());
+    }
+    else
+    {
+        input_trace("SAS: LookupPrivilegeValue(SeTcb) failed: %lu", GetLastError());
+    }
+
+    CloseHandle(token);
+}
+
+static void send_secure_attention(void)
+{
+    static send_sas_fn send_sas = NULL;
+    static int         resolved = 0;
+
+    if (!resolved)
+    {
+        resolved = 1;
+        enable_tcb_privilege();
+
+        HMODULE sas = LoadLibraryA("sas.dll");
+        if (sas != NULL)
+            send_sas = (send_sas_fn)GetProcAddress(sas, "SendSAS");
+
+        input_trace("SAS: sas.dll=%p SendSAS=%p", (void *)sas, (void *)send_sas);
+    }
+
+    if (send_sas != NULL)
+    {
+        enable_tcb_privilege();
+        send_sas(FALSE);
+        input_trace("SAS: SendSAS(FALSE) done, err=%lu", GetLastError());
+    }
+}
 
 // Сопоставление X11 keysym -> виртуальный код Windows (для непечатаемых клавиш).
 static WORD keysym_to_vk(rfbKeySym key)
@@ -59,6 +154,55 @@ static int is_extended_vk(WORD vk)
     }
 }
 
+// Заполняет KEYBDINPUT для виртуальной клавиши.
+//
+// Инъектим скан-кодом (KEYEVENTF_SCANCODE), а не виртуальной клавишей: так
+// событие максимально похоже на аппаратное и его принимают современные
+// (UWP/WinUI) приложения. С wVk-инъекцией «Блокнот» в Win11 не получал
+// Enter/стрелки, хотя SendInput возвращал успех, а Unicode-символы доходили.
+static void fill_vk(INPUT *in, WORD vk, rfbBool down)
+{
+    WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+
+    BOOL extended = is_extended_vk(vk);
+
+    if (scan == 0)
+    {
+        // В текущей раскладке скан-кода нет — откатываемся на виртуальную клавишу.
+        in->ki.wVk = vk;
+        in->ki.wScan = 0;
+        in->ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    }
+    else
+    {
+        in->ki.wVk = 0;
+        in->ki.wScan = scan;
+        in->ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+    }
+
+    if (extended)
+        in->ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+}
+
+// Кто сейчас в фокусе — для разбора «клавиша ушла не туда».
+static void trace_foreground(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (fg == NULL)
+    {
+        input_trace("  fg=<null>");
+        return;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+
+    wchar_t cls[64] = { 0 };
+    GetClassNameW(fg, cls, 64);
+
+    input_trace("  fg=0x%p pid=%lu class=%ls", (void *)fg, pid, cls);
+}
+
 // Печатаемый символ -> виртуальная клавиша (для акселераторов Ctrl/Alt+клавиша).
 static WORD char_to_vk(rfbKeySym key)
 {
@@ -88,6 +232,18 @@ static BOOL g_altDown = FALSE;
 
 static void send_key(rfbBool down, rfbKeySym key)
 {
+    input_trace("send_key key=0x%04X down=%d ctrl=%d alt=%d",
+                (unsigned)key, (int)down, (int)g_ctrlDown, (int)g_altDown);
+    trace_foreground();
+
+    // SAS приходит парой down/up — реагируем только на нажатие.
+    if (key == SAS_KEYSYM)
+    {
+        if (down)
+            send_secure_attention();
+        return;
+    }
+
     // Отслеживаем Ctrl/Alt: при зажатом модификаторе печатаемые клавиши нужно
     // слать виртуальной клавишей, иначе не работают Ctrl+C, Alt+Y и т.п.
     switch (key)
@@ -108,11 +264,10 @@ static void send_key(rfbBool down, rfbKeySym key)
             WORD vk = char_to_vk(key);
             if (vk != 0)
             {
-                in.ki.wVk = vk;
-                in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-                if (is_extended_vk(vk))
-                    in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-                SendInput(1, &in, sizeof(in));
+                fill_vk(&in, vk, down);
+                UINT sent = SendInput(1, &in, sizeof(in));
+                input_trace("  ctrl/alt vk=0x%02X scan=0x%02X flags=0x%04X sent=%u err=%lu",
+                            vk, in.ki.wScan, in.ki.dwFlags, sent, GetLastError());
                 return;
             }
         }
@@ -126,14 +281,18 @@ static void send_key(rfbBool down, rfbKeySym key)
     {
         WORD vk = keysym_to_vk(key);
         if (vk == 0)
+        {
+            input_trace("  vk=0 -> drop");
             return;
-        in.ki.wVk = vk;
-        in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-        if (is_extended_vk(vk))
-            in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        fill_vk(&in, vk, down);
     }
 
-    SendInput(1, &in, sizeof(in));
+    {
+        UINT sent = SendInput(1, &in, sizeof(in));
+        input_trace("  send vk=0x%02X scan=0x%02X flags=0x%04X sent=%u err=%lu",
+                    in.ki.wVk, in.ki.wScan, in.ki.dwFlags, sent, GetLastError());
+    }
 }
 
 static int g_prevButtonMask = 0;

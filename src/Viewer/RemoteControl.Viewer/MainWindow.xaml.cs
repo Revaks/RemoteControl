@@ -1,12 +1,16 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Net.Security;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading.Channels;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -34,6 +38,43 @@ public partial class MainWindow : Window
     // сериализуется (SslStream не терпит параллельных Write). Семафор гасит
     // лишние кадры, чтобы не копить очередь и не перегружать канал.
     private readonly SemaphoreSlim _pointerLock = new(1, 1);
+
+    // Клавиатура: низкоуровневый хук + очередь, чтобы порядок нажатий не терялся
+    // и колбэк хука не тормозил (иначе Windows снимет хук по таймауту).
+    private const uint SasKeysym = 0xFFFFFF00; // Ctrl+Alt+Del на удалённой машине
+    private KeyboardHook? _keyboardHook;
+    private Channel<(uint Keysym, bool Down)>? _keyChannel;
+    private Task? _keyPump;
+
+    // HWND окна консоли: по нему проверяем, что хук должен перехватывать ввод
+    // (GetForegroundWindow() == наше окно), иначе клавиши уйдут в чужое приложение.
+    private IntPtr _hwnd;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    // Диагностика клавиатуры (App.config: KeyboardTrace=true) — пишем в
+    // keyboard-trace.log рядом с exe, чтобы разбирать «клавиша не дошла».
+    private static readonly bool KeyTrace = AppSettings.KeyboardTrace;
+    private static readonly object TraceLock = new();
+
+    private static void TraceKey(string message)
+    {
+        if (!KeyTrace)
+            return;
+
+        try
+        {
+            lock (TraceLock)
+                File.AppendAllText(
+                    Path.Combine(AppContext.BaseDirectory, "keyboard-trace.log"),
+                    $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // трассировка не должна мешать работе
+        }
+    }
 
     public MainWindow()
     {
@@ -164,6 +205,11 @@ public partial class MainWindow : Window
             ConnectButton.IsEnabled = false;
             DisconnectButton.IsEnabled = true;
             ScreenHost.Focus();
+
+            // Перехватываем клавиатуру хуком: иначе Win/Alt+Tab срабатывают
+            // и локально, и на удалённой машине.
+            StartInputCapture(client);
+            StatusText.Text += " | клавиатура захвачена (Ctrl+Alt+Shift — локально, Ctrl+Alt+End — Ctrl+Alt+Del)";
         }
         catch (Exception ex)
         {
@@ -183,6 +229,10 @@ public partial class MainWindow : Window
 
     private async Task DisconnectAsync()
     {
+        // Сначала снимаем хук и досылаем оставшиеся клавиши, пока канал ещё жив:
+        // иначе после Dispose клиента нажатия уходят в никуда.
+        await StopInputCaptureAsync();
+
         if (_client is not null)
         {
             _client.FrameUpdated -= OnFrameUpdated;
@@ -212,6 +262,10 @@ public partial class MainWindow : Window
     {
         Dispatcher.InvokeAsync(async () =>
         {
+            // Соединение разорвано — снимаем хук, чтобы клавиши больше не
+            // перехватывались (иначе они «исчезали» бы, не доходя до удалённого стола).
+            await StopInputCaptureAsync();
+
             StatusText.Text = $"Соединение с {_connectedHost} разорвано.";
             ConnectButton.IsEnabled = true;
             DisconnectButton.IsEnabled = false;
@@ -347,6 +401,97 @@ public partial class MainWindow : Window
         }
     }
 
+    // ---------- Захват клавиатуры хуком ----------
+
+    /// <summary>Ставит низкоуровневый хук и насос, который шлёт клавиши в RFB.</summary>
+    private void StartInputCapture(RfbClient client)
+    {
+        if (_keyboardHook is not null)
+            return;
+
+        _hwnd = new WindowInteropHelper(this).Handle;
+
+        // Канал развязывает колбэк хука и запись в SslStream: колбэк обязан
+        // вернуться за миллисекунды, иначе Windows молча снимает хук.
+        _keyChannel = Channel.CreateUnbounded<(uint Keysym, bool Down)>(
+            new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+        var hook = new KeyboardHook { CaptureAllowed = HookCaptureAllowed };
+        hook.KeyEvent += (keysym, down) => _keyChannel?.Writer.TryWrite((keysym, down));
+        hook.SecureAttention += () =>
+        {
+            _keyChannel?.Writer.TryWrite((SasKeysym, true));
+            _keyChannel?.Writer.TryWrite((SasKeysym, false));
+        };
+
+        if (!hook.Start())
+        {
+            hook.Dispose();
+            _keyChannel.Writer.TryComplete();
+            _keyChannel = null;
+            StatusText.Text += " | хук недоступен, клавиатура — через события окна";
+            TraceKey("hook FAILED to install");
+            return;
+        }
+
+        _keyPump = Task.Run(() => PumpKeysAsync(_keyChannel.Reader));
+        _keyboardHook = hook;
+        TraceKey($"hook installed, hwnd=0x{_hwnd.ToInt64():X}, trace={(KeyTrace ? "on" : "off")}");
+    }
+
+    /// <summary>Снимает хук и досылает оставшиеся в очереди клавиши.</summary>
+    private async Task StopInputCaptureAsync()
+    {
+        KeyboardHook? hook = _keyboardHook;
+        _keyboardHook = null;
+        hook?.Dispose();
+
+        Channel<(uint Keysym, bool Down)>? channel = _keyChannel;
+        _keyChannel = null;
+        channel?.Writer.TryComplete();
+
+        Task? pump = _keyPump;
+        _keyPump = null;
+        if (pump is not null)
+        {
+            // Если запись залипла, не подвешиваем отключение — просто бросаем насос.
+            try { await Task.WhenAny(pump, Task.Delay(1000)); }
+            catch (Exception) { }
+        }
+    }
+
+    private async Task PumpKeysAsync(ChannelReader<(uint Keysym, bool Down)> reader)
+    {
+        await foreach ((uint keysym, bool down) in reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            RfbClient? client = _client;
+            if (client is null)
+                continue;
+
+            try
+            {
+                TraceKey($"send sym=0x{keysym:X4} down={down}");
+                await client.SendKeyEventAsync(keysym, down, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Разрыв соединения обработает OnDisconnected.
+            }
+        }
+    }
+
+    /// <summary>Хук глобальный: перехватываем только когда активно окно консоли
+    /// и фокус не в локальном поле ввода/списке.</summary>
+    private bool HookCaptureAllowed()
+    {
+        if (_hwnd == IntPtr.Zero)
+            return false;
+
+        // Модальные диалоги (MessageBox) забирают фокус — им тоже отдаём клавиши,
+        // иначе Enter/Escape в диалоге не сработают.
+        return GetForegroundWindow() == _hwnd && !IsLocalInputTarget();
+    }
+
     private async void ScreenHost_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
         (int x, int y) = GetFrameBufferPoint(e.GetPosition(ScreenImage));
@@ -433,7 +578,10 @@ public partial class MainWindow : Window
 
     private async void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (_client is null || IsLocalInputTarget())
+        // Когда хук установлен, клавиатурой владеет он: WPF-события остаются
+        // только фолбэком на случай, если SetWindowsHookEx не сработал
+        // (иначе клавиши уходили бы удалённому столу дважды).
+        if (_keyboardHook is not null || _client is null || IsLocalInputTarget())
             return;
 
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
@@ -446,7 +594,7 @@ public partial class MainWindow : Window
 
     private async void MainWindow_PreviewKeyUp(object sender, KeyEventArgs e)
     {
-        if (_client is null || IsLocalInputTarget())
+        if (_keyboardHook is not null || _client is null || IsLocalInputTarget())
             return;
 
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;

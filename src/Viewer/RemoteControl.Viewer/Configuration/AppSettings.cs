@@ -34,4 +34,8 @@ public static class AppSettings
 
     public static bool PushAgentByDefault =>
         Get("PushAgentByDefault", "true").Equals("true", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Отладочная трассировка клавиатуры в keyboard-trace.log рядом с exe.</summary>
+    public static bool KeyboardTrace =>
+        Get("KeyboardTrace", "false").Equals("true", StringComparison.OrdinalIgnoreCase);
 }

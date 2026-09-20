@@ -25,7 +25,25 @@ public static class KeysymMapper
     [DllImport("user32.dll")]
     private static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
+    /// <summary>Состояние модификаторов, снятое вызывающей стороной (хук или WPF).</summary>
+    public readonly record struct KeyState(bool Shift, bool Ctrl, bool Alt, bool CapsLock);
+
     public static bool TryGetKeysym(Key key, ModifierKeys modifiers, out uint keysym)
+    {
+        bool caps = (Keyboard.GetKeyStates(Key.CapsLock) & KeyStates.Toggled) != 0;
+        return TryGetKeysym(key,
+            new KeyState(
+                (modifiers & ModifierKeys.Shift) != 0,
+                (modifiers & ModifierKeys.Control) != 0,
+                (modifiers & ModifierKeys.Alt) != 0,
+                caps),
+            out keysym);
+    }
+
+    public static bool TryGetKeysym(Key key, bool shift, bool ctrl, bool alt, bool capsLock, out uint keysym) =>
+        TryGetKeysym(key, new KeyState(shift, ctrl, alt, capsLock), out keysym);
+
+    public static bool TryGetKeysym(Key key, KeyState state, out uint keysym)
     {
         // Спецклавиши с фиксированным keysym.
         keysym = key switch
@@ -53,6 +71,10 @@ public static class KeysymMapper
             Key.RightAlt   => 0xffea,
             Key.LWin       => 0xffeb,
             Key.RWin       => 0xffec,
+            // Переключатели: их состояние должно уходить на удалённый стол,
+            // иначе CapsLock/NumLock включаются локально, а не там, где печатают.
+            Key.CapsLock   => 0xffe5,
+            Key.NumLock    => 0xff7f,
             _ => 0,
         };
         if (keysym != 0)
@@ -70,11 +92,11 @@ public static class KeysymMapper
         }
 
         // Ctrl/Alt: базовый keysym -> агент отправит виртуальную клавишу.
-        if ((modifiers & (ModifierKeys.Control | ModifierKeys.Alt)) != 0)
+        if (state.Ctrl || state.Alt)
             return TryGetBaseKeysym(key, out keysym);
 
         // Обычный ввод: реальный символ (регистр, Shift, CapsLock, раскладка).
-        if (TryGetChar(key, out uint ch))
+        if (TryGetChar(key, state, out uint ch))
         {
             keysym = ch;
             return true;
@@ -116,8 +138,8 @@ public static class KeysymMapper
         return keysym != 0;
     }
 
-    /// <summary>Символ, который даст клавиша при текущих модификаторах и раскладке.</summary>
-    private static bool TryGetChar(Key key, out uint codepoint)
+    /// <summary>Символ, который даст клавиша при заданных модификаторах и раскладке.</summary>
+    private static bool TryGetChar(Key key, KeyState state, out uint codepoint)
     {
         codepoint = 0;
 
@@ -125,16 +147,16 @@ public static class KeysymMapper
         if (vk == 0)
             return false;
 
-        byte[] state = new byte[256];
-        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0) state[0x10] = 0x80;
-        if ((Keyboard.Modifiers & ModifierKeys.Control) != 0) state[0x11] = 0x80;
-        if ((Keyboard.Modifiers & ModifierKeys.Alt) != 0) state[0x12] = 0x80;
-        if ((Keyboard.GetKeyStates(Key.CapsLock) & KeyStates.Toggled) != 0) state[0x14] = 1;
+        byte[] kstate = new byte[256];
+        if (state.Shift) kstate[0x10] = 0x80;
+        if (state.Ctrl) kstate[0x11] = 0x80;
+        if (state.Alt) kstate[0x12] = 0x80;
+        if (state.CapsLock) kstate[0x14] = 1;
 
         uint scan = MapVirtualKey(vk, 0); // MAPVK_VK_TO_VSC
         var sb = new StringBuilder(8);
 
-        int n = ToUnicodeEx(vk, scan, state, sb, sb.Capacity, 0, GetKeyboardLayout(0));
+        int n = ToUnicodeEx(vk, scan, kstate, sb, sb.Capacity, 0, GetKeyboardLayout(0));
         if (n <= 0 || sb.Length == 0)
             return false;
 
