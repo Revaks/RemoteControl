@@ -11,7 +11,7 @@
 
   <Package Name="Remote Control"
            Manufacturer="Revaks"
-           Version="1.2.4.0"
+           Version="1.2.5.0"
            UpgradeCode="5E7C9A21-3B4D-4F68-9C2A-7D1E5B8F3A90"
            Scope="perMachine"
            Compressed="yes"
@@ -19,7 +19,12 @@
 
     <SummaryInformation Description="Remote Control: агент (mTLS + AD) и консоль оператора; автономный мини-CA и автовыпуск сертификатов" />
 
-    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия Remote Control." />
+    <!-- Schedule="afterInstallValidate": старый продукт удаляется ДО установки нового.
+         По умолчанию (afterInstallFinalize) удаление старой версии идёт после установки
+         новой и сносит только что записанные файлы (на WIN11 так «похудел» каталог ca\:
+         осталось 6 файлов вместо 187, и ЦС не запускался). -->
+    <MajorUpgrade Schedule="afterInstallValidate"
+                  DowngradeErrorMessage="Установлена более новая версия Remote Control." />
     <MediaTemplate EmbedCab="yes" />
 
     <Launch Condition="Installed OR VersionNT64" Message="Remote Control требует 64-битную Windows." />
