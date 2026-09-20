@@ -203,6 +203,34 @@ RUNNING, `/health` = ok, машинный сертификат `CN=WIN11HOST.cor
 `enroll-user.cmd` выпустил клиентский `CN=administrator`, mTLS-подключение к 127.0.0.1:5900
 дало баннер `RFB 003.008`.
 
+### 5.2.1. Релиз через GitHub Actions (`.github/workflows/release.yml`)
+
+Раньше MSI собирались руками и заливались в релиз вручную (в v1.0.0/v1.0.1 — только два
+отдельных пакета, единого MSI там нет). Теперь релиз собирается по тегу: `git push origin v1.2.2`
+→ runner `windows-latest` собирает агент, консоль и единый MSI и публикует релиз с ассетами
+(`GITHUB_TOKEN`, `permissions: contents: write`).
+
+**Грабли CI (все ловились по очереди):**
+
+- на `windows-latest` теперь **Visual Studio Enterprise 2026** (VS 18), а пакетный CMake —
+  4.x, который не собирает LibVNCServer 0.9.14 (`cmake_minimum_required < 3.5`) → берём
+  **CMake 3.29.6 через pip** (`python -m pip install cmake==3.29.6`);
+- генератор `-G "Visual Studio 17 2022"` на таком раннере падает (`could not find any instance
+  of Visual Studio`), а pip-овый CMake по умолчанию берёт `NMake Makefiles`, который не понимает
+  `-A x64` → собираем через **MSVC-окружение (`ilammy/msvc-dev-cmd`) + Ninja**;
+- `-DCMAKE_MAKE_PROGRAM=$env:NINJA_EXE` в PowerShell **не подставляется** (CMake получает
+  литерал `$env:NINJA_EXE`) → кладём каталог pip-скриптов в `GITHUB_PATH` и не задаём его вообще;
+- Ninja — single-config, поэтому exe агента лежит в `build/agent/RemoteControlAgent.exe`
+  (без `Release\`), и в `build-single-msi.ps1`/`build-msi.ps1` передаётся `-AgentExe` явно;
+- логи упавших прогонов без авторизации не скачать, поэтому хвост ошибки печатается
+  **аннотацией** (`::error title=...::...`, до этого — `::notice::` с версией VS/CMake) —
+  иначе причина не видна.
+
+Проверка: прогон по тегу `v1.2.2` — success, в релизе
+`RemoteControl.msi` (68.7 МБ) + legacy `RemoteControlAgent.msi`/`RemoteControlViewer.msi`;
+скачанный MSI — валидный (WiX 5.0.2, x64, `ProductName=Remote Control`).
+
+
 ---
 
 ## 6. Агент (C, Schannel + LibVNCServer)

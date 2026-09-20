@@ -181,6 +181,9 @@ Computer/User и автоенроллментом).
 > Подробная пошаговая инструкция (требования, сборка, установка, проверка, диагностика) —
 > [docs/INSTALL.md](docs/INSTALL.md).
 
+Готовый установщик — в [Releases](https://github.com/Revaks/RemoteControl/releases/latest)
+(`RemoteControl.msi`); релиз собирается автоматически по тегу `v*`.
+
 `installer\build-single-msi.ps1` собирает **один** установщик
 `dist\msi\RemoteControl.msi` (~69 МБ, всё self-contained). Достаточно поставить его
 на сервер — и удалёнка работает без ручных шагов:

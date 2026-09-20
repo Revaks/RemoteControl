@@ -73,6 +73,11 @@ wix extension add --global WixToolset.Firewall.wixext/5.0.2
 
 ## 2. Сборка единого MSI
 
+Готовый установщик собирать не обязательно — он приложен к релизам:
+<https://github.com/Revaks/RemoteControl/releases/latest> (`RemoteControl.msi`).
+Релиз собирается автоматически по тегу `v*` (workflow `.github/workflows/release.yml`).
+Ниже — как собрать самому.
+
 ### 2.1. Агент (C++, CMake)
 
 ```powershell
