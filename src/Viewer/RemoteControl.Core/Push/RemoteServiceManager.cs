@@ -53,6 +53,9 @@ public sealed class RemoteServiceManager : IDisposable
         return true;
     }
 
+    /// <summary>true, если службу создали МЫ (только тогда её можно удалять при завершении сеанса).</summary>
+    public bool CreatedByUs { get; private set; }
+
     /// <summary>Создаёт и запускает службу агента (от LocalSystem, запуск по требованию).</summary>
     public void CreateAndStart(string serviceName, string displayName, string remoteBinaryPath)
     {
@@ -84,6 +87,32 @@ public sealed class RemoteServiceManager : IDisposable
                 throw new Win32Exception(err, $"Не удалось создать службу '{serviceName}'.");
             }
         }
+        else
+        {
+            CreatedByUs = true;
+        }
+
+        if (!StartServiceW(_service, 0, null))
+        {
+            int err = Marshal.GetLastWin32Error();
+            if (err != 1056 /* ERROR_SERVICE_ALREADY_RUNNING */)
+                throw new Win32Exception(err, $"Не удалось запустить службу '{serviceName}'.");
+        }
+    }
+
+    /// <summary>
+    /// Запускает уже существующую службу (например, поставленную MSI), ничего не создавая.
+    /// Файлы агента при этом не подменяются, а служба помечается как «не наша» — чтобы
+    /// завершение push-сеанса не удалило установленный агент.
+    /// </summary>
+    public void StartExisting(string serviceName)
+    {
+        if (_service != IntPtr.Zero)
+            throw new InvalidOperationException("Служба уже открыта.");
+
+        _service = OpenServiceW(_scm, serviceName, SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP | DELETE);
+        if (_service == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), $"Не удалось открыть службу '{serviceName}'.");
 
         if (!StartServiceW(_service, 0, null))
         {

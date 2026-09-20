@@ -34,6 +34,16 @@ public sealed class PushSession : IAsyncDisposable
     /// <summary>Копирует агент и запускает службу. agentExePath — локальный путь к собранному агенту.</summary>
     public async Task DeployAsync(string agentExePath, TimeSpan? startTimeout = null, CancellationToken ct = default)
     {
+        // Если агент уже установлен (например, единым MSI), его служба уже есть: не подменяем
+        // файл и не создаём свою — иначе CleanupAsync удалит установленную службу и оставит
+        // машину без агента. Просто убеждаемся, что служба запущена и порт открыт.
+        if (_scm.ServiceExists(ServiceName))
+        {
+            _scm.StartExisting(ServiceName);
+            await WaitForPortAsync(_port, startTimeout ?? TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+            return;
+        }
+
         if (!File.Exists(agentExePath))
             throw new FileNotFoundException("Не найден бинарник агента.", agentExePath);
 
@@ -48,7 +58,10 @@ public sealed class PushSession : IAsyncDisposable
         await WaitForPortAsync(_port, startTimeout ?? TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
     }
 
-    /// <summary>Останавливает службу, удаляет её и файлы агента.</summary>
+    /// <summary>
+    /// Останавливает и удаляет службу с файлами агента — но только если их поставили МЫ.
+    /// Установленный агент (MSI) при завершении сеанса не трогаем.
+    /// </summary>
     public async Task CleanupAsync()
     {
         if (_cleanupDone)
@@ -58,6 +71,9 @@ public sealed class PushSession : IAsyncDisposable
         {
             try
             {
+                if (!_scm.CreatedByUs)
+                    return;
+
                 _scm.StopAndDelete();
                 RemoteServiceManager.DeleteRemoteFiles(_host, $@"Temp\{RemoteExeName}");
             }
