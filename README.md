@@ -1,0 +1,239 @@
+# RemoteControl
+
+Инструмент удалённого управления машинами домена Windows в стиле DameWare/UltraVNC:
+**служба-агент** на целевой машине + **WPF-консоль оператора**.
+Транспорт — RFB (VNC) поверх TLS с взаимной аутентификацией (mTLS), авторизация —
+по членству пользователя в группе AD.
+
+> Лабораторный стенд (виртуалки, домен, PKI, учётки, как поднять заново) описан отдельно —
+> см. [ENVIRONMENT.md](ENVIRONMENT.md).
+
+---
+
+## Возможности
+
+- **Экран**: захват через DXGI Desktop Duplication, фолбэк и защищённый рабочий стол —
+  GDI `BitBlt`. Клиенту уходит только изменившийся прямоугольник, курсор дорисовывается.
+- **Захват защищённого стола**: UAC, Ctrl+Alt+Del и экран блокировки видны в уже открытом
+  сеансе — поток захвата динамически следит за активным рабочим столом (`OpenInputDesktop`).
+- **Мышь и клавиатура**: абсолютные координаты, колесо, Unicode-ввод (регистр/раскладка как
+  на клиенте), акселераторы `Ctrl+C`/`Alt+Y`, системные сочетания (`Win`, `Alt+Tab`) уходят
+  на удалённый стол и **не срабатывают локально**.
+- **SAS**: `Ctrl+Alt+End` → `Ctrl+Alt+Del` на удалённой машине (через `SendSAS`).
+- **Авторизация по AD**: клиентский сертификат, UPN из SAN, проверка членства в группе через LDAP.
+- **Push-режим (DameWare-style)**: доставка агента через `admin$` и запуск службы без ручной установки.
+- **MSI-установщики** (WiX v5) для агента и консоли.
+
+---
+
+## Архитектура
+
+```
+┌──────────────────────────┐        TLS 1.2/1.3 + mTLS        ┌───────────────────────────┐
+│  Консоль оператора       │  ───────────────────────────────▶ │  Агент (служба, SYSTEM)   │
+│  RemoteControl.Viewer    │        RFB (VNC)                 │  RemoteControlAgent.exe   │
+│  WPF .NET 8 (win-x64)    │  ◀─────────────────────────────── │  :5900                    │
+└──────────────────────────┘        кадры / ввод               └─────────────┬─────────────┘
+                                                                             │ loopback + IPC
+                                                               ┌─────────────▼─────────────┐
+                                                               │ helper в консольной сессии │
+                                                               │ SYSTEM, winsta0\default    │
+                                                               │ LibVNCServer + захват/ввод │
+                                                               └───────────────────────────┘
+```
+
+1. Служба (LocalSystem) слушает порт, принимает TLS и **обязательный** клиентский сертификат.
+2. Из сертификата берётся UPN, проверяется членство в разрешённых группах AD (LDAP).
+3. В активной консольной сессии поднимается helper (`--session --listen 127.0.0.1 --port N`)
+   на рабочем столе `Default`; служба ретранслирует TLS ↔ loopback.
+4. Helper = LibVNCServer + отдельный поток захвата/ввода, который следит за активным рабочим
+   столом. `SendInput` выполняется из этого же потока, поэтому ввод доходит и до защищённых окон.
+5. После отключения клиента helper завершается сам (служба добивает его через 3 с).
+
+---
+
+## Требования
+
+| Компонент | Требования |
+|---|---|
+| Сборка агента | Windows, Visual Studio 2022 (C++ workload) или Build Tools, CMake ≥ 3.20 |
+| Сборка консоли | .NET SDK 8 (+ Windows Desktop targeting pack) |
+| Запуск консоли | ничего: сборка self-contained |
+| Целевая машина | Windows Server 2019+ / Windows 10+; для push — SMB 445 и удалённое управление службами |
+| Инфраструктура | PKI с клиентскими сертификатами (EKU Client Auth) и группой AD |
+
+LibVNCServer 0.9.14 подтягивается CMake'ом автоматически (`FetchContent`, тег
+`LibVNCServer-0.9.14`); можно указать локальный исходник через `-DLIBVNCSERVER_DIR=...`.
+
+---
+
+## Сборка
+
+### Консоль оператора (WPF, self-contained)
+
+```powershell
+dotnet publish src\Viewer\RemoteControl.Viewer\RemoteControl.Viewer.csproj `
+  -c Release -r win-x64 --self-contained true -o dist\viewer-sc
+```
+
+`dist\viewer-sc\RemoteControl.Viewer.exe` не требует установленного .NET.
+Готовые скрипты: `scripts\build-viewer.ps1`.
+
+### Агент
+
+```powershell
+cmake -S src\Agent -B build\agent -A x64
+cmake --build build\agent --config Release
+# build\agent\Release\RemoteControlAgent.exe
+```
+
+Готовый скрипт: `scripts\build-agent.ps1`.
+
+### MSI (WiX v5)
+
+```powershell
+$env:DOTNET_ROOT = 'C:\dotnet'    # если .NET не зарегистрирован в реестре
+powershell -NoProfile -ExecutionPolicy Bypass -File installer\build-msi.ps1
+# dist\msi\RemoteControlAgent.msi, dist\msi\RemoteControlViewer.msi
+```
+
+---
+
+## Установка и настройка агента
+
+```powershell
+msiexec /i dist\msi\RemoteControlAgent.msi /qn /l*v agent.log
+```
+
+MSI ставит `RemoteControlAgent.exe` в `C:\Program Files\RemoteControl`, регистрирует службу
+(LocalSystem, автостарт) и правило брандмауэра TCP 5900.
+
+Параметры агента — в реестре (или через GPO):
+
+```
+HKLM\SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters
+  ListenPort         REG_DWORD     порт (по умолчанию 5900)
+  RequireClientCert  REG_DWORD     1 = требовать клиентский сертификат
+  AllowedGroups      REG_MULTI_SZ  DN групп AD, которым разрешён доступ
+```
+
+```powershell
+.\scripts\configure-agent.ps1 -AllowedGroups @("CN=Remote Control Operators,OU=Groups,DC=corp,DC=local")
+```
+
+Если `AllowedGroups` не задан, доступ разрешается любому доменному сертификату — **только для лаборатории**.
+
+Машинный сертификат агента (`LocalMachine\My`, EKU Server Auth) должен иметь закрытый ключ,
+доступный SYSTEM.
+
+---
+
+## Подключение
+
+1. Запустить консоль: `dist\viewer-sc\RemoteControl.Viewer.exe`.
+2. Выбрать компьютер из списка AD (двойной клик) или ввести имя/IP.
+3. Галка **«Push-агент»** — развернуть агент через `admin$` и запустить службу. При отключении
+   push-режим **останавливает и удаляет** службу на целевой машине.
+4. «Подключить».
+
+Конфиг консоли — `RemoteControl.Viewer.dll.config` рядом с exe:
+
+| Ключ | Назначение |
+|---|---|
+| `AgentPort` | порт агента (5900) |
+| `AgentExePath` | путь к агенту для push-режима |
+| `PushAgentByDefault` | ставить галку «Push-агент» при старте |
+| `InternalRootCaThumbprint` | SHA-256 отпечаток корневого CA (pinning); пусто = любой доверенный корень |
+| `KeyboardTrace` | отладочная трассировка клавиатуры (см. «Отладка») |
+
+---
+
+## Мышь и клавиатура
+
+Ввод перехватывается, пока окно консоли активно; мышь не блокируется, поэтому локальным
+интерфейсом пользоваться можно всегда.
+
+| Действие | Поведение |
+|---|---|
+| Любая клавиша при активной консоли | уходит на удалённый стол, локально подавляется |
+| `Win`, `Alt+Tab`, `Ctrl+Esc`, `Alt+F4` | уходят на удалённый стол (локально «Пуск» не открывается) |
+| Фокус в локальном поле («Компьютер», поиск, список) | клавиши идут локальной ОС |
+| Другое окно на переднем плане | перехвата нет, клавиши идут локальной ОС |
+| `Ctrl+Alt+End` | SAS (Ctrl+Alt+Del) на удалённой машине |
+| `Ctrl+Alt+Shift` (удерживать) + клавиша | клавиша отдаётся локальной ОС |
+| `CapsLock`, `NumLock` | переключаются на удалённом столе |
+
+Технически: `WH_KEYBOARD_LL` (`KeyboardHook.cs`) + очередь `Channel` и отдельный насос записи
+в RFB — колбэк хука не должен блокироваться, иначе Windows снимает хук.
+Подробности и грабли — в [ENVIRONMENT.md](ENVIRONMENT.md), §7.1.
+
+---
+
+## Безопасность
+
+- Только mTLS; при `RequireClientCert=1` без клиентского сертификата соединение отклоняется.
+- Авторизация по группе AD (LDAP `defaultNamingContext` из RootDSE, экранирование фильтра).
+- Проверка отзыва сертификатов (CRL) на стороне .NET — CRL-сервер должен быть доступен.
+- Опциональный pinning корневого CA (`InternalRootCaThumbprint`).
+- Ключи и сертификаты **не коммитятся** (`.gitignore`: `*.pfx`, `*.key`, `certs/`).
+- Агент слушает порт как SYSTEM и умеет захватывать защищённый стол — это по духу
+  «админский удалённый доступ», поэтому доступ ограничивается группой и сертификатом.
+
+---
+
+## Отладка
+
+| Что | Как включить | Куда пишется |
+|---|---|---|
+| Клавиатура в консоли | `KeyboardTrace=true` в `RemoteControl.Viewer.dll.config` | `keyboard-trace.log` рядом с exe |
+| Ввод в агенте | создать маркер `C:\Windows\Temp\rc-input.enable` | `C:\Windows\Temp\rc-input.log` |
+| Ошибки консоли | всегда | `viewer-errors.log` рядом с exe |
+| События агента | всегда | журнал Application, источник `RemoteControlAgent` |
+
+Ключевые события агента: `1201/1204` доступ, `1102` нет клиентского сертификата,
+`1402` подключение, `1302` helper слушает, `1404` ретрансляция, `1405` сеанс завершён,
+`1360–1362` смена рабочего стола, `1330` ошибка BitBlt.
+
+---
+
+## Тестирование
+
+- `tools/stress` — параллельный ввод (защита от вылетов консоли при быстром движении мыши):
+  ожидаем `ok=300 failed=0, still connected: True`.
+- Консольный smoke-тест стека (TLS → RFB → кадр): `core-smoke` из лабораторного стенда
+  (см. [ENVIRONMENT.md](ENVIRONMENT.md) §9).
+- Позитивный/негативный mTLS-тест `openssl s_client` — там же.
+
+---
+
+## Структура репозитория
+
+```
+src/Agent/                     агент: C11 + Win32 + Schannel + LibVNCServer
+  agent_main.c                 точка входа, --session / --secure
+  service.c                    служба, приём TLS, ретрансляция
+  session.c                    запуск helper в консольной сессии
+  tls.c                        Schannel, mTLS
+  auth.c                       UPN из сертификата + проверка группы в AD
+  capture.c, dxgi_capture.c    захват экрана, слежение за рабочим столом
+  input.c                      очередь ввода, SendInput, SAS
+src/Viewer/RemoteControl.Core/ ядро консоли: RFB-клиент, TLS, AD, push
+src/Viewer/RemoteControl.Viewer/ WPF-консоль: UI, хук клавиатуры, маппинг keysym
+tools/stress/                  стресс-тест ввода
+installer/                     WiX-проекты и сборка MSI
+scripts/                       сборка и настройка (PowerShell)
+ENVIRONMENT.md                 описание лабораторного стенда
+```
+
+---
+
+## Известные ограничения
+
+1. **Win11 UWP-приложения** («Блокнот», «Пуск») принимают Unicode-символы и системные клавиши,
+   но игнорируют инжектированные `Enter`/стрелки в поле ввода — это ограничение Win11, а не агента.
+2. **Экран SAS на Win11 25H2** в лаборатории не воспроизвелся: `SendSAS` вызывается без ошибки
+   (`SeTcbPrivilege` включена, `SoftwareSASGeneration=2`), но экран безопасности не появлялся.
+   На Windows Server не проверялось.
+3. **Push-режим удаляет службу** на целевой машине при отключении.
+4. Из RFB-кодировок реализованы `Raw`, `CopyRect`, `Hextile` (плюс псевдокодировка `DesktopSize`).
+5. Поддерживается одна активная консольная сессия целевой машины.
