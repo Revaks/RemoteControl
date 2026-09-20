@@ -12,7 +12,7 @@
 
   <Package Name="Remote Control Agent"
            Manufacturer="Revaks"
-           Version="1.0.0.0"
+           Version="1.0.1.0"
            UpgradeCode="6DCCCA7F-4E43-4432-929B-A6459462096F"
            Scope="perMachine"
            Compressed="yes"

@@ -2,19 +2,21 @@
 
 #include <windows.h>
 
-// GDI-захват экрана (MVP). TODO(этап 5): DXGI Desktop Duplication + мультимонитор.
-// Возврат capture_screen(): 1 = кадр изменился (скопирован в dstBgra),
-// 0 = кадр не изменился, -1 = ошибка.
-// Если кадр изменился, в outX/outY/outW/outH записывается ограничивающий
-// прямоугольник изменённых пикселей (координаты фреймбуфера) — позволяет
-// отправлять клиенту только грязную область вместо полного кадра.
-int  capture_init(int width, int height);
-int  capture_screen(void* dstBgra, int width, int height, int stride,
-                    int* outX, int* outY, int* outW, int* outH);
-void capture_cleanup(void);
+// Захват экрана. Работает в отдельном потоке, который привязан к активному
+// рабочему столу (Default или Winlogon) и потому видит в том числе:
+//   * обычный рабочий стол пользователя — через DXGI Desktop Duplication
+//     (быстро), с фолбэком на GDI BitBlt;
+//   * защищённый рабочий стол (UAC, экран блокировки/Ctrl+Alt+Del) — через
+//     GDI BitBlt с DC физического дисплея (CreateDC("DISPLAY")).
+// Поток захвата также отправляет накопленный ввод (SendInput) — иначе ввод
+// не доходил бы до защищённых окон.
 
-// Переключает захват на DC физического дисплея (CreateDC("DISPLAY")) вместо
-// GetDC(NULL). Нужно для защищённого рабочего стола Winlogon: DC текущего
-// рабочего стола там не даёт кадров, а DISPLAY DC отдаёт физический экран.
-// Вызывать до capture_init().
-void capture_set_display_dc(void);
+// Инициализация и запуск потока захвата. 0 — успех, -1 — ошибка.
+int capture_start(int width, int height);
+void capture_stop(void);
+
+// Забирает сформированный кадр: сравнивает его с фреймбуфером dstBgra,
+// копирует изменения и возвращает ограничивающий прямоугольник.
+// Возврат: 1 — есть изменения (outX/outY/outW/outH заполнены), 0 — нет.
+int capture_take_dirty(void* dstBgra, int stride,
+                       int* outX, int* outY, int* outW, int* outH);

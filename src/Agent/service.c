@@ -250,27 +250,11 @@ static DWORD WINAPI handle_client(LPVOID param)
         rc_event_log(EVENTLOG_INFORMATION_TYPE, 1402, L"Подключение: %s", upn);
     }
 
-    // 3. Хелпер: если консоль заблокирована — SYSTEM-хелпер на рабочем столе
-    //    Winlogon (захват экрана входа), иначе обычный хелпер в сессии пользователя.
-    helper = session_spawn_secure_helper(&helperPort);
-    if (helper != NULL)
-    {
-        // Secure-хелпер быстро завершается с кодом 2, если консоль НЕ заблокирована.
-        if (WaitForSingleObject(helper, 1500) == WAIT_OBJECT_0)
-        {
-            CloseHandle(helper);
-            helper = NULL;
-        }
-    }
-
-    if (helper != NULL)
-    {
-        rc_event_log(EVENTLOG_INFORMATION_TYPE, 1406, L"Консоль заблокирована: захват Winlogon (%u)", helperPort);
-    }
-    else
-    {
-        helper = session_spawn_helper(&helperPort);
-    }
+    // 3. Helper: всегда один SYSTEM-хелпер в консольной сессии на рабочем столе
+    //    Default. Его поток захвата сам переключается на Winlogon, когда активен
+    //    защищённый рабочий стол (UAC, Ctrl+Alt+Del, экран блокировки), поэтому
+    //    оператор видит админские окна и может вводить пароль.
+    helper = session_spawn_helper(&helperPort);
 
     if (helper == NULL)
     {
@@ -297,8 +281,10 @@ cleanup:
         CertFreeCertificateContext(machineCert);
     if (helper != NULL)
     {
-        // Даём хелперу завершиться и закрываем.
-        WaitForSingleObject(helper, 5000);
+        // Хелпер завершается сам после отключения клиента; если не успел —
+        // добиваем, чтобы не копились процессы и DXGI-дупликаторы.
+        if (WaitForSingleObject(helper, 3000) == WAIT_TIMEOUT)
+            TerminateProcess(helper, 0);
         CloseHandle(helper);
     }
     closesocket(client);

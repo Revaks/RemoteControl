@@ -59,15 +59,65 @@ static int is_extended_vk(WORD vk)
     }
 }
 
-void input_send_key(rfbBool down, rfbKeySym key)
+// Печатаемый символ -> виртуальная клавиша (для акселераторов Ctrl/Alt+клавиша).
+static WORD char_to_vk(rfbKeySym key)
 {
+    if (key >= 0x61 && key <= 0x7a) return (WORD)(key - 0x20); // 'a'..'z' -> VK 0x41..0x5A
+    if (key >= 0x41 && key <= 0x5a) return (WORD)key;          // 'A'..'Z'
+    if (key >= 0x30 && key <= 0x39) return (WORD)key;          // '0'..'9'
+
+    switch (key)
+    {
+        case 0x2d: return VK_OEM_MINUS;   // '-'
+        case 0x3d: return VK_OEM_PLUS;    // '='
+        case 0x2c: return VK_OEM_COMMA;   // ','
+        case 0x2e: return VK_OEM_PERIOD;  // '.'
+        case 0x2f: return VK_OEM_2;       // '/'
+        case 0x3b: return VK_OEM_1;       // ';'
+        case 0x27: return VK_OEM_7;       // '\''
+        case 0x5b: return VK_OEM_4;       // '['
+        case 0x5d: return VK_OEM_6;       // ']'
+        case 0x5c: return VK_OEM_5;       // '\'
+        case 0x60: return VK_OEM_3;       // '`'
+        default: return 0;
+    }
+}
+
+static BOOL g_ctrlDown = FALSE;
+static BOOL g_altDown = FALSE;
+
+static void send_key(rfbBool down, rfbKeySym key)
+{
+    // Отслеживаем Ctrl/Alt: при зажатом модификаторе печатаемые клавиши нужно
+    // слать виртуальной клавишей, иначе не работают Ctrl+C, Alt+Y и т.п.
+    switch (key)
+    {
+        case 0xffe3: case 0xffe4: g_ctrlDown = down; break;
+        case 0xffe9: case 0xffea: g_altDown = down; break;
+        default: break;
+    }
+
     INPUT in;
     ZeroMemory(&in, sizeof(in));
     in.type = INPUT_KEYBOARD;
 
     if (key >= 0x20 && key <= 0x7e)
     {
-        // Печатаемые ASCII отправляем Unicode-символом — не зависит от локальной раскладки.
+        if (g_ctrlDown || g_altDown)
+        {
+            WORD vk = char_to_vk(key);
+            if (vk != 0)
+            {
+                in.ki.wVk = vk;
+                in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+                if (is_extended_vk(vk))
+                    in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+                SendInput(1, &in, sizeof(in));
+                return;
+            }
+        }
+
+        // По умолчанию — Unicode-символ: не зависит от локальной раскладки.
         in.ki.wVk = 0;
         in.ki.wScan = (WORD)key;
         in.ki.dwFlags = KEYEVENTF_UNICODE | (down ? 0 : KEYEVENTF_KEYUP);
@@ -88,7 +138,7 @@ void input_send_key(rfbBool down, rfbKeySym key)
 
 static int g_prevButtonMask = 0;
 
-void input_send_pointer(int buttonMask, int x, int y)
+static void send_pointer(int buttonMask, int x, int y)
 {
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
@@ -125,4 +175,86 @@ void input_send_pointer(int buttonMask, int x, int y)
 
     // Колесо не «держим»: следующее событие без битов колеса не должно вызывать повторный скролл.
     g_prevButtonMask = buttonMask & 0x07;
+}
+
+// ---------- очередь событий ----------
+
+typedef struct
+{
+    int        type;   // 0 — клавиша, 1 — указатель
+    int        down;   // для клавиши
+    rfbKeySym  key;    // для клавиши
+    int        mask;   // для указателя
+    int        x;
+    int        y;
+} input_event;
+
+#define INPUT_QUEUE_SIZE 2048
+
+static input_event       s_queue[INPUT_QUEUE_SIZE];
+static volatile LONG     s_head;
+static volatile LONG     s_tail;
+static CRITICAL_SECTION  s_lock;
+
+void input_init(void)
+{
+    InitializeCriticalSection(&s_lock);
+    s_head = 0;
+    s_tail = 0;
+}
+
+static void enqueue(const input_event* e)
+{
+    EnterCriticalSection(&s_lock);
+    LONG next = (s_tail + 1) % INPUT_QUEUE_SIZE;
+    if (next != s_head) // при переполнении событие теряется
+    {
+        s_queue[s_tail] = *e;
+        s_tail = next;
+    }
+    LeaveCriticalSection(&s_lock);
+}
+
+void input_queue_key(rfbBool down, rfbKeySym keysym)
+{
+    input_event e;
+    ZeroMemory(&e, sizeof(e));
+    e.type = 0;
+    e.down = down ? 1 : 0;
+    e.key = keysym;
+    enqueue(&e);
+}
+
+void input_queue_pointer(int buttonMask, int x, int y)
+{
+    input_event e;
+    ZeroMemory(&e, sizeof(e));
+    e.type = 1;
+    e.mask = buttonMask;
+    e.x = x;
+    e.y = y;
+    enqueue(&e);
+}
+
+void input_process_pending(void)
+{
+    for (;;)
+    {
+        input_event e;
+
+        EnterCriticalSection(&s_lock);
+        if (s_head == s_tail)
+        {
+            LeaveCriticalSection(&s_lock);
+            break;
+        }
+        e = s_queue[s_head];
+        s_head = (s_head + 1) % INPUT_QUEUE_SIZE;
+        LeaveCriticalSection(&s_lock);
+
+        if (e.type == 0)
+            send_key(e.down ? TRUE : FALSE, e.key);
+        else
+            send_pointer(e.mask, e.x, e.y);
+    }
 }

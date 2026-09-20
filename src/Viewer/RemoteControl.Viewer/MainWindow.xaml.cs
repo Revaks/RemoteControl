@@ -30,6 +30,11 @@ public partial class MainWindow : Window
     private int _port;
     private string _connectedHost = string.Empty;
 
+    // MouseMove приходит десятками событий в секунду, а запись в поток
+    // сериализуется (SslStream не терпит параллельных Write). Семафор гасит
+    // лишние кадры, чтобы не копить очередь и не перегружать канал.
+    private readonly SemaphoreSlim _pointerLock = new(1, 1);
+
     public MainWindow()
     {
         InitializeComponent();
@@ -283,6 +288,65 @@ public partial class MainWindow : Window
         return (x, y);
     }
 
+    // ---------- Отправка ввода (устойчиво к разрыву соединения) ----------
+
+    /// <summary>Отправляет событие мыши, дожидаясь завершения предыдущей отправки.</summary>
+    private async Task SendPointerAsync(byte mask, int x, int y)
+    {
+        RfbClient? client = _client;
+        if (client is null)
+            return;
+
+        await _pointerLock.WaitAsync().ConfigureAwait(true);
+        try
+        {
+            await client.SendPointerEventAsync(mask, (ushort)x, (ushort)y, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // Соединение разорвано — консоль не должна падать из-за этого.
+        }
+        finally
+        {
+            _pointerLock.Release();
+        }
+    }
+
+    /// <summary>Перемещение мыши без ожидания: если предыдущий кадр ещё в полёте — пропускаем.</summary>
+    private async Task SendPointerCoalescedAsync(byte mask, int x, int y)
+    {
+        RfbClient? client = _client;
+        if (client is null || !_pointerLock.Wait(0))
+            return;
+
+        try
+        {
+            await client.SendPointerEventAsync(mask, (ushort)x, (ushort)y, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
+            _pointerLock.Release();
+        }
+    }
+
+    private async Task SendKeyAsync(uint keysym, bool down)
+    {
+        RfbClient? client = _client;
+        if (client is null)
+            return;
+
+        try
+        {
+            await client.SendKeyEventAsync(keysym, down, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
     private async void ScreenHost_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
         (int x, int y) = GetFrameBufferPoint(e.GetPosition(ScreenImage));
@@ -297,8 +361,7 @@ public partial class MainWindow : Window
             _ => _buttonMask,
         };
 
-        if (_client is not null)
-            await _client.SendPointerEventAsync(_buttonMask, (ushort)x, (ushort)y, CancellationToken.None);
+        await SendPointerAsync(_buttonMask, x, y);
 
         _mouseCaptured = ScreenHost.CaptureMouse();
         ScreenHost.Focus();
@@ -314,7 +377,7 @@ public partial class MainWindow : Window
         if (x < 0)
             return;
 
-        await _client.SendPointerEventAsync(_buttonMask, (ushort)x, (ushort)y, CancellationToken.None);
+        await SendPointerCoalescedAsync(_buttonMask, x, y);
         e.Handled = true;
     }
 
@@ -333,7 +396,7 @@ public partial class MainWindow : Window
 
         (int x, int y) = GetFrameBufferPoint(e.GetPosition(ScreenImage));
         if (x >= 0)
-            await _client.SendPointerEventAsync(_buttonMask, (ushort)x, (ushort)y, CancellationToken.None);
+            await SendPointerAsync(_buttonMask, x, y);
 
         if (_mouseCaptured)
         {
@@ -354,8 +417,8 @@ public partial class MainWindow : Window
 
         // Биты 3 и 4 маски RFB — колесо вверх/вниз.
         byte wheelMask = e.Delta > 0 ? (byte)0x08 : (byte)0x10;
-        await _client.SendPointerEventAsync((byte)(_buttonMask | wheelMask), (ushort)x, (ushort)y, CancellationToken.None);
-        await _client.SendPointerEventAsync(_buttonMask, (ushort)x, (ushort)y, CancellationToken.None);
+        await SendPointerAsync((byte)(_buttonMask | wheelMask), x, y);
+        await SendPointerAsync(_buttonMask, x, y);
         e.Handled = true;
     }
 
@@ -374,9 +437,9 @@ public partial class MainWindow : Window
             return;
 
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
-        if (KeysymMapper.TryGetKeysym(key, out uint keysym))
+        if (KeysymMapper.TryGetKeysym(key, Keyboard.Modifiers, out uint keysym))
         {
-            await _client.SendKeyEventAsync(keysym, down: true, CancellationToken.None);
+            await SendKeyAsync(keysym, down: true);
             e.Handled = true;
         }
     }
@@ -387,9 +450,9 @@ public partial class MainWindow : Window
             return;
 
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
-        if (KeysymMapper.TryGetKeysym(key, out uint keysym))
+        if (KeysymMapper.TryGetKeysym(key, Keyboard.Modifiers, out uint keysym))
         {
-            await _client.SendKeyEventAsync(keysym, down: false, CancellationToken.None);
+            await SendKeyAsync(keysym, down: false);
             e.Handled = true;
         }
     }

@@ -27,6 +27,7 @@ add_executable(RemoteControlAgent WIN32
     auth.c
     session.c
     capture.c
+    dxgi_capture.c
     input.c
     eventlog.c)
 
@@ -39,7 +40,8 @@ target_compile_definitions(RemoteControlAgent PRIVATE
 
 target_link_libraries(RemoteControlAgent PRIVATE
     vncserver
-    ws2_32 secur32 crypt32 ncrypt wldap32 netapi32 advapi32 user32 gdi32 wtsapi32)
+    ws2_32 secur32 crypt32 ncrypt wldap32 netapi32 advapi32 user32 gdi32 wtsapi32
+    d3d11 dxgi dxguid)
 
 # Заголовки LibVNCServer: rfb/rfb.h лежит в корне исходников, а сгенерированный
 # rfb/rfbconfig.h — в корне бинарного дерева (target_include_directories у

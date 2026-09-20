@@ -15,6 +15,13 @@ internal sealed class RfbStream
     private int _readPos;
     private int _readLen;
 
+    // Запись сериализуется: SslStream не допускает параллельных Write
+    // («This method may not be called when another write operation is pending»),
+    // а события мыши/клавиатуры приходят пачками из UI-потока.
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    // Отдельный буфер для записи, чтобы не конфликтовать с _ioBuffer чтения.
+    private readonly byte[] _writeBuffer = new byte[16];
+
     public RfbStream(Stream stream) => _stream = stream;
 
     public Stream BaseStream => _stream;
@@ -68,30 +75,41 @@ internal sealed class RfbStream
 
     public Task WriteByteAsync(byte value, CancellationToken ct)
     {
-        _ioBuffer[0] = value;
-        return WriteExactAsync(_ioBuffer.AsMemory(0, 1), ct);
+        _writeBuffer[0] = value;
+        return WriteExactAsync(_writeBuffer.AsMemory(0, 1), ct);
     }
 
     public Task WriteUInt16Async(ushort value, CancellationToken ct)
     {
-        BinaryPrimitives.WriteUInt16BigEndian(_ioBuffer, value);
-        return WriteExactAsync(_ioBuffer.AsMemory(0, 2), ct);
+        BinaryPrimitives.WriteUInt16BigEndian(_writeBuffer, value);
+        return WriteExactAsync(_writeBuffer.AsMemory(0, 2), ct);
     }
 
     public Task WriteUInt32Async(uint value, CancellationToken ct)
     {
-        BinaryPrimitives.WriteUInt32BigEndian(_ioBuffer, value);
-        return WriteExactAsync(_ioBuffer.AsMemory(0, 4), ct);
+        BinaryPrimitives.WriteUInt32BigEndian(_writeBuffer, value);
+        return WriteExactAsync(_writeBuffer.AsMemory(0, 4), ct);
     }
 
     public Task WriteInt32Async(int value, CancellationToken ct)
     {
-        BinaryPrimitives.WriteInt32BigEndian(_ioBuffer, value);
-        return WriteExactAsync(_ioBuffer.AsMemory(0, 4), ct);
+        BinaryPrimitives.WriteInt32BigEndian(_writeBuffer, value);
+        return WriteExactAsync(_writeBuffer.AsMemory(0, 4), ct);
     }
 
-    public Task WriteExactAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct) =>
-        _stream.WriteAsync(buffer, ct).AsTask();
+    /// <summary>Запись в поток с сериализацией (см. комментарий к _writeLock).</summary>
+    public async Task WriteExactAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _stream.WriteAsync(buffer, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
 
     /// <summary>Читает строку Latin-1 заданной длины (используется в ServerInit / ServerCutText).</summary>
     public async Task<string> ReadLatin1Async(int length, CancellationToken ct)

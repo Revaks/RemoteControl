@@ -151,9 +151,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\redeploy2.ps1
 
 1. Служба (SYSTEM) слушает `:5900`, принимает TLS (Schannel, mTLS — клиентский сертификат обязателен).
 2. Из клиентского сертификата извлекается UPN, проверяется членство в `Remote Control Operators`.
-3. Если консоль **разблокирована**: в интерактивной сессии (session 1) запускается helper (`--session --listen 127.0.0.1 --port N`) — LibVNCServer VNC-сервер, захватывает экран через `BitBlt`.
-4. Если консоль **заблокирована**: служба берёт SYSTEM-токен `winlogon.exe` консольной сессии и запускает helper на защищённом рабочем столе `WinSta0\Winlogon` (`--secure ...`). Он снимает экран входа/блокировки через DC физического дисплея (`CreateDC("DISPLAY")`).
-5. Служба ретранслирует: TLS-клиент ↔ loopback-порт helper.
+3. В активной консольной сессии (session 1) как **SYSTEM** запускается helper (`--session --listen 127.0.0.1 --port N`) на рабочем столе `Default` (SYSTEM-токен берётся у `winlogon.exe` консольной сессии).
+4. Helper = LibVNCServer + отдельный поток захвата/ввода, который **следит за активным рабочим столом** (`OpenInputDesktop` + `SetThreadDesktop`):
+   - на `Default` — захват через **DXGI Desktop Duplication** (быстро), фолбэк — GDI `BitBlt`;
+   - на `Winlogon` (UAC, Ctrl+Alt+Del, экран блокировки) — GDI `BitBlt` с DC физического дисплея (`CreateDC("DISPLAY")`).
+   Ввод (`SendInput`) выполняется из этого же потока, поэтому доходит и до защищённых окон (можно видеть UAC/экран входа и вводить пароль администратора).
+5. Служба ретранслирует: TLS-клиент ↔ loopback-порт helper. Helper завершается сам после отключения клиента (служба добивает его через 3 с, чтобы не копились процессы и не исчерпывался лимит DXGI-дупликаторов).
 
 Исправленные в ходе работ баги (важно не откатывать):
 
@@ -169,9 +172,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\redeploy2.ps1
 - `agent_main.c`: `--session` **и** `--secure` диспатчатся в `session_run` (иначе `--secure` уходил в `service_run` и мгновенно выходил по мутексу).
 - `auth.c`: LDAP-поиск с базой `defaultNamingContext` из RootDSE.
 - `capture.c`: `BitBlt(SRCCOPY | CAPTUREBLT)`; в secure-режиме источник — `CreateDC("DISPLAY")`, а не `GetDC(NULL)` (событие 1330 при ошибке BitBlt). **Курсор мыши дорисовывается поверх кадра** (`GetCursorInfo` + `DrawIconEx`), т.к. BitBlt сам курсор не захватывает. **Убран отдельный буфер `s_prevBits` и полнокадровый `memcmp`** (агент падал с 0xc0000005 в `VCRUNTIME140.dll`, viewer получал `EndOfStreamException`); сравнение с предыдущим кадром теперь идёт построчно прямо при копировании во фреймбуфер LibVNCServer. **`capture_screen` возвращает ограничивающий прямоугольник изменённых пикселей** — клиенту уходит только грязная область, а не весь экран.
-- `session.c`: цикл `rfbProcessEvents(server, 10000)` без `Sleep(30)`; **`server->deferUpdateTime = 0` и `deferPtrUpdateTime = 0`** (иначе отложенная отправка добавляла лишний цикл ~30 мс и резала fps вдвое).
+- `capture.c` + `dxgi_capture.c` (агент): захват в отдельном потоке, следящем за активным рабочим столом. **DXGI Desktop Duplication** (`dxgi_capture.c`, D3D11 + `IDXGIOutputDuplication`, пересоздание при `ACCESS_LOST`; события 1350/1351/1362) для обычного стола, GDI `BitBlt(SRCCOPY | CAPTUREBLT)` как фолбэк и для защищённого стола (`CreateDC("DISPLAY")`). **Курсор мыши дорисовывается поверх кадра** (`GetCursorInfo` + `DrawIconEx`; на VM курсор может быть `CURSOR_SUPPRESSED` — тогда не рисуем, как и сама ОС). **Убран отдельный буфер `s_prevBits` и полнокадровый `memcmp`** (агент падал с 0xc0000005 в `VCRUNTIME140.dll`, viewer получал `EndOfStreamException`); сравнение идёт построчно при копировании, заодно считается **ограничивающий прямоугольник изменений** — клиенту уходит только грязная область.
+- `input.c` (агент): RFB-колбэки только кладут события в очередь, `SendInput` выполняет поток захвата (привязан к активному рабочему столу) — иначе ввод не доходит до UAC/экрана блокировки. Печатаемые символы шлются как Unicode (регистр/раскладка как на клиенте), а при зажатом Ctrl/Alt — как виртуальная клавиша (работают акселераторы Ctrl+C, Alt+Y).
+- `session.c`: единый SYSTEM-helper вместо выбора «secure/user» при подключении; завершение helper'а после отключения клиента (`hadClient`); цикл `rfbProcessEvents(server, 10000)` без `Sleep(30)`; **`server->deferUpdateTime = 0` и `deferPtrUpdateTime = 0`** (иначе отложенная отправка добавляла лишний цикл ~30 мс и резала fps вдвое).
 
-**Важно про захват Winlogon:** источник захвата выбирается **в момент подключения**. Если консоль заблокировали/разблокировали во время активного сеанса — нужно переподключиться, чтобы агент перевыбрал helper.
+**Важно про захват Winlogon:** рабочий стол выбирается **динамически** — поток захвата следит за `OpenInputDesktop`, поэтому UAC/экран блокировки появляются в уже открытом сеансе без переподключения (события 1360–1362).
 
 ---
 
@@ -215,7 +220,10 @@ schtasks /run /tn 'RemoteControlViewer'
 - `Decoders.cs`: порядок Hextile-субпрямоугольников по LibVNCServer — сначала `count`, затем для каждого цвет (если coloured) + XY/WH. **Пиксельное значение в Hextile (background/foreground/цвет субрект) читается как 4 байта в порядке байт пиксельного формата (B,G,R,X), а НЕ как big-endian uint32** — иначе экран розово-маджентовый.
 - `TlsTransport.cs`: `userCertificateSelectionCallback: null`; `CipherSuitesPolicy` только не на Windows.
 - `RemoteServiceManager.cs`: приведение `dwWin32ExitCode` к `int`.
-- `KeysymMapper.cs`: убран дубликат `Key.Enter`/`Key.Return`.
+- `KeysymMapper.cs`: убран дубликат `Key.Enter`/`Key.Return`. **Обычный ввод отдаёт реальный символ с учётом Shift/CapsLock/раскладки** (`ToUnicodeEx`) — до этого буквы всегда уходили в нижнем регистре, и пароль с заглавными/символами набрать было нельзя. При зажатом Ctrl/Alt отдаётся базовый keysym → агент шлёт виртуальную клавишу (акселераторы).
+- `RfbStream.cs` (**фикс вылетов консоли**): все операции записи сериализуются `SemaphoreSlim`. `SslStream` не допускает параллельных `WriteAsync` («This method may not be called when another write operation is pending»), а `MouseMove` приходит пачками — консоль падала через несколько секунд после начала движения мыши (`.NET Runtime` id 1026 в Application log). Запись использует отдельный `_writeBuffer`, чтобы не конфликтовать с буфером чтения.
+- `MainWindow.xaml.cs`: `MouseMove` отправляется в режиме коалесцирования (если предыдущий кадр ещё в полёте — пропускается, чтобы не копить очередь), кнопки/колесо/клавиши — с ожиданием; исключения ввода гасятся, разрыв соединения не роняет UI.
+- `App.xaml.cs`: `DispatcherUnhandledException` + `AppDomain.UnhandledException` пишутся в `viewer-errors.log` рядом с exe, ошибка в обработчике события больше не завершает процесс.
 
 Важно: на VM `dotnet` установлен в `C:\dotnet` через dotnet-install и **не зарегистрирован в реестре**, поэтому обычный (не self-contained) exe выдаёт «You must install .NET Desktop Runtime». Используй self-contained сборку или запуск через `C:\dotnet\dotnet.exe App.dll`.
 
@@ -290,6 +298,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\allevents.ps1
 ```
 
 Ключевые ID: `1204` доступ разрешён, `1102` нет клиентского сертификата, `1402` подключение, `1302` helper слушает, `1404` ретрансляция, `1405` сеанс завершён, `1406` консоль заблокирована → захват Winlogon, `1324` secure-helper захватывает Winlogon, `1320`/`1321`/`1322`/`1323` проблемы запуска secure-helper, `1330` ошибка BitBlt.
+
+### Стресс-тест параллельного ввода (защита от вылетов консоли)
+
+Воспроизводит сценарий падения viewer при быстром движении мыши (параллельные `WriteAsync` в `SslStream`). Проект: `C:\Setup\stress`.
+
+```powershell
+dotnet run --project C:\Setup\stress\stress.csproj -c Release
+# ожидание: ok=300 failed=0, still connected: True
+```
+
+Если консоль всё же упала — смотри `viewer-errors.log` рядом с exe (`C:\Program Files\Remote Control Viewer\`) и `.NET Runtime` (id 1026) в Application log.
 
 ---
 

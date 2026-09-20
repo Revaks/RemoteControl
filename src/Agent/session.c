@@ -22,20 +22,25 @@
 
 static int   g_port = 0;
 static char  g_listenIp[64] = "127.0.0.1";
-static BOOL  g_secure = FALSE;
+
+// Определены ниже; нужны при запуске хелпера.
+static BOOL enable_debug_privilege(void);
+static HANDLE get_console_system_token(void);
 
 // ---------- колбэки RFB ----------
 
 static void on_key(rfbBool down, rfbKeySym key, rfbClientPtr cl)
 {
     (void)cl;
-    input_send_key(down, key);
+    // Только в очередь: SendInput выполнит поток захвата, привязанный
+    // к активному рабочему столу (иначе ввод не дойдёт до UAC/экрана блокировки).
+    input_queue_key(down, key);
 }
 
 static void on_pointer(int buttonMask, int x, int y, rfbClientPtr cl)
 {
     (void)cl;
-    input_send_pointer(buttonMask, x, y);
+    input_queue_pointer(buttonMask, x, y);
 }
 
 // ---------- запуск хелпера ----------
@@ -53,41 +58,7 @@ int session_run(int argc, wchar_t** argv)
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_listenIp,
                 (int)sizeof(g_listenIp), NULL, NULL);
         }
-        else if (wcscmp(argv[i], L"--secure") == 0)
-            g_secure = TRUE;
     }
-
-    // Защищённый режим: убеждаемся, что консоль действительно заблокирована
-    // (активный рабочий стол — Winlogon). Если нет — быстро выходим, служба
-    // должна использовать обычный хелпер пользовательской сессии.
-    if (g_secure)
-    {
-        HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
-        if (input == NULL)
-        {
-            rc_event_log(EVENTLOG_ERROR_TYPE, 1321, L"Secure helper: OpenInputDesktop failed: %lu", GetLastError());
-            return 2;
-        }
-
-        wchar_t name[64] = { 0 };
-        DWORD need = 0;
-        BOOL named = GetUserObjectInformationW(input, UOI_NAME, name, (DWORD)sizeof(name), &need);
-        CloseDesktop(input);
-
-        if (!named || _wcsicmp(name, L"Winlogon") != 0)
-        {
-            rc_event_log(EVENTLOG_INFORMATION_TYPE, 1320,
-                L"Secure helper: консоль не заблокирована (desktop=%s), выход", named ? name : L"?");
-            return 2;
-        }
-
-        rc_event_log(EVENTLOG_INFORMATION_TYPE, 1324, L"Secure helper: захват рабочего стола Winlogon");
-    }
-
-    // В защищённом режиме снимаем физический дисплей (DC рабочего стола Winlogon
-    // не отдаёт кадры через BitBlt).
-    if (g_secure)
-        capture_set_display_dc();
 
     // Корректный размер экрана при высоком DPI.
     SetProcessDPIAware();
@@ -103,6 +74,7 @@ int session_run(int argc, wchar_t** argv)
     char* framebuffer = (char*)malloc((size_t)width * height * 4);
     if (framebuffer == NULL)
         return 1;
+    ZeroMemory(framebuffer, (size_t)width * height * 4);
 
     int fakeArgc = 1;
     char* fakeArgv[] = { (char*)"RemoteControlAgent", NULL };
@@ -157,7 +129,7 @@ int session_run(int argc, wchar_t** argv)
         return 1;
     }
 
-    if (capture_init(width, height) != 0)
+    if (capture_start(width, height) != 0)
     {
         rfbShutdownServer(server, TRUE);
         rfbScreenCleanup(server);
@@ -167,27 +139,35 @@ int session_run(int argc, wchar_t** argv)
 
     rc_event_log(EVENTLOG_INFORMATION_TYPE, 1302, L"Session helper слушает %S:%d", g_listenIp, g_port);
 
-    // Главный цикл: обрабатываем RFB-события и обновляем кадр, пока есть клиенты.
-    // Короткий таймаут select задаёт темп кадров, события ввода при этом
-    // обрабатываются сразу.
+    // Главный цикл: обрабатываем RFB-события и отдаём сформированные кадры.
+    // Захват (DXGI/GDI) и ввод идут в отдельном потоке, следящем за активным
+    // рабочим столом.
+    int hadClient = 0;
     while (rfbIsActive(server))
     {
         rfbProcessEvents(server, 10000); // до 10 мс на события
 
         if (server->clientHead != NULL)
         {
+            hadClient = 1;
+
             int dirtyX = 0, dirtyY = 0, dirtyW = 0, dirtyH = 0;
-            int changed = capture_screen(framebuffer, width, height, width * 4,
-                                         &dirtyX, &dirtyY, &dirtyW, &dirtyH);
-            if (changed > 0)
+            if (capture_take_dirty(framebuffer, width * 4,
+                                   &dirtyX, &dirtyY, &dirtyW, &dirtyH) > 0)
                 rfbMarkRectAsModified(server, dirtyX, dirtyY,
                                       dirtyX + dirtyW, dirtyY + dirtyH);
+        }
+        else if (hadClient)
+        {
+            // Клиент отключился — helper больше не нужен, завершаемся, чтобы не
+            // копились процессы и не исчерпывался лимит DXGI Desktop Duplication.
+            break;
         }
     }
 
     rc_event_log(EVENTLOG_INFORMATION_TYPE, 1303, L"Session helper завершает работу");
 
-    capture_cleanup();
+    capture_stop();
     rfbShutdownServer(server, TRUE);
     rfbScreenCleanup(server);
     free(framebuffer);
@@ -208,10 +188,15 @@ HANDLE session_spawn_helper(unsigned short* out_port)
         return NULL;
     }
 
-    HANDLE token = NULL;
-    if (!WTSQueryUserToken(sessionId, &token))
+    // Helper запускаем как SYSTEM в активной консольной сессии: только так он
+    // может привязаться к защищённому рабочему столу (UAC, экран блокировки)
+    // и отправить туда ввод.
+    enable_debug_privilege();
+
+    HANDLE token = get_console_system_token();
+    if (token == NULL)
     {
-        rc_event_log(EVENTLOG_ERROR_TYPE, 1311, L"WTSQueryUserToken failed: %lu", GetLastError());
+        rc_event_log(EVENTLOG_ERROR_TYPE, 1311, L"Не удалось получить SYSTEM-токен консольной сессии");
         return NULL;
     }
 
@@ -247,7 +232,9 @@ HANDLE session_spawn_helper(unsigned short* out_port)
 
     *out_port = ntohs(sa.sin_port);
 
-    // Запускаем этот же exe в пользовательской сессии на её рабочем столе.
+    // Запускаем этот же exe как SYSTEM в консольной сессии на рабочем столе
+    // Default: поток захвата внутри сам переключится на Winlogon, когда
+    // появится UAC/экран блокировки.
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
 
