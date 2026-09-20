@@ -259,12 +259,20 @@ WITH_WEBSOCKETS/WITH_ZLIB/WITH_LZO/WITH_JPEG/WITH_PNG/...`) принудител
 записанные файлы с теми же путями. В `installer/RemoteControl.wxs`:
 `<MajorUpgrade Schedule="afterInstallValidate" .../>`.
 
-**Push-режим временный.** `PushSession.CleanupAsync` (= `DisposeAsync`) делает
-`RemoteServiceManager.StopAndDelete()` и удаляет `admin$\Temp\RemoteControlAgent.exe`. Поэтому
-после сеанса push-агента служба исчезает — именно так «пропали» службы на DC1 и WIN11HOST
-(удаление службы уносит и ветку `...\Services\RemoteControlAgent\Parameters`). У MSI-установки
-это оставляет рассинхрон: продукт в «Установка приложений» есть, а службы нет — лечится
-переустановкой. Push ставит агент в `C:\Windows\Temp`, MSI — в `Program Files`.
+**Push-режим временный — но только для того, что поставил сам.** `PushSession.CleanupAsync`
+(= `DisposeAsync`) делает `RemoteServiceManager.StopAndDelete()` и удаляет
+`admin$\Temp\RemoteControlAgent.exe`. Push ставит агент в `C:\Windows\Temp`, MSI — в `Program Files`.
+
+Так на DC1 и WIN11HOST «пропали» службы: push-сеанс снёс службу `RemoteControlAgent` — ту же,
+что поставил MSI (удаление службы уносит и ветку `...\Services\RemoteControlAgent\Parameters`),
+и в «Установке приложений» продукт остался без агента. Исправлено в 1.2.6:
+`RemoteServiceManager.CreatedByUs` + `StartExisting()`, `PushSession.DeployAsync` при уже
+существующей службе только запускает её (файлы не копирует), а `CleanupAsync` удаляет службу и
+файл **только если создал их сам**.
+
+Проверено (1.2.6): push с DC1 на WIN11HOST, где агент уже стоял от MSI, — подключение прошло,
+`C:\Windows\Temp\RemoteControlAgent.exe` не создавался, служба после сеанса осталась RUNNING
+с `ImagePath = C:\Program Files\RemoteControl\RemoteControlAgent.exe`.
 
 **Проверено 20.09.2026 (DC1, MSI 1.2.4/1.2.5):** DC1 (контроллер домена) с установленным MSI
 развернул агент на WIN11HOST тем же кодом, что использует консоль
