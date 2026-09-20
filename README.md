@@ -174,6 +174,41 @@ Computer/User и автоенроллментом).
 
 ---
 
+## Единый MSI (агент + ЦС + консоль)
+
+`installer\build-single-msi.ps1` собирает **один** установщик
+`dist\msi\RemoteControl.msi` (~69 МБ, всё self-contained). Достаточно поставить его
+на сервер — и удалёнка работает без ручных шагов:
+
+| Что делает MSI | Детали |
+|---|---|
+| Агент | `C:\Program Files\RemoteControl\RemoteControlAgent.exe` + служба `RemoteControlAgent` (автостарт) |
+| Брандмауэр | входящие TCP 5900 (агент), 80 и 8555 (ЦС) |
+| Автономный мини-CA | `...\RemoteControl\ca\labca.exe`, задача `RemoteControlLabCa` (SYSTEM, at startup) |
+| Машинный сертификат | задача `RemoteControlEnrollMachine` (SYSTEM, at startup) + выпуск сразу при установке |
+| Правила доступа | `ListenPort=5900`, `RequireClientCert=1`, `AllowLocalAdmins=1`, `AllowDomainUsers=1` |
+| Консоль оператора | `C:\Program Files\Remote Control Viewer` + ярлыки |
+| Сертификат оператора | ярлык «Получить сертификат оператора» (`enroll-user.cmd`) |
+
+Сборка:
+
+```powershell
+$env:DOTNET_ROOT='C:\dotnet'
+powershell -File installer\build-single-msi.ps1        # -> dist\msi\RemoteControl.msi
+msiexec /i dist\msi\RemoteControl.msi                  # установка
+```
+
+Что происходит при установке: urlacl на 80/8555 → запуск мини-CA → выпуск машинного
+сертификата (`C:\ProgramData\RemoteControl\enroll-machine.log`, `labca.log`) → старт
+службы агента. При удалении MSI задачи снимаются, ЦС останавливается.
+
+**Консоль оператора.** Сервер — сам себе ЦС, поэтому сертификат оператора надо взять
+у того сервера, к которому он подключается: `enroll-user.cmd -CaUrl http://<server>/ -EnrollUrl http://<server>:8555/`
+(кладёт корень ЦС в доверенные и выпускает клиентский сертификат в `CurrentUser\My`).
+Сертификаты разных серверов не взаимозаменяемы — под каждый сервер свой.
+
+---
+
 ## Подключение
 
 1. Запустить консоль: `dist\viewer-sc\RemoteControl.Viewer.exe`.

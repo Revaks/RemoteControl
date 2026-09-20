@@ -37,14 +37,25 @@ internal static class Program
     private static readonly string EnrollPrefix =
         Environment.GetEnvironmentVariable("LABCA_ENROLL_PREFIX") ?? "http://+:8555/";
 
-    private static readonly string PublicUrl =
-        (Environment.GetEnvironmentVariable("LABCA_PUBLIC_URL") ?? "http://dc1.corp.local/").TrimEnd('/') + "/";
+    // Публичный URL ЦС. По умолчанию — сам сервер (автономный режим для MSI):
+    // в этот адрес попадают CDP/CRL и оттуда клиенты забирают корень.
+    private static readonly string PublicUrl = ResolvePublicUrl();
+
+    private static string ResolvePublicUrl()
+    {
+        string? fromEnv = Environment.GetEnvironmentVariable("LABCA_PUBLIC_URL");
+        if (!string.IsNullOrWhiteSpace(fromEnv)) return fromEnv.TrimEnd('/') + "/";
+        try { return $"http://{System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName()).HostName}/"; }
+        catch { return $"http://{Environment.MachineName}/"; }
+    }
 
     private static readonly string CrlUrl = PublicUrl + "ca.crl";
     private static readonly string CaSubject =
         Environment.GetEnvironmentVariable("LABCA_SUBJECT") ?? "CN=RemoteControl Lab CA";
     private static readonly string LogPath =
-        Environment.GetEnvironmentVariable("LABCA_LOG") ?? @"C:\Setup\labca\labca.log";
+        Environment.GetEnvironmentVariable("LABCA_LOG") ??
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                     "RemoteControl", "labca.log");
 
     private static void Log(string message)
     {
@@ -190,6 +201,10 @@ internal static class Program
         string caller = identity.Name; // DOMAIN\account
         string account = caller.Contains('\\') ? caller[(caller.IndexOf('\\') + 1)..] : caller;
 
+        // Локальный SYSTEM определяем по SID S-1-5-18: имя локализовано
+        // (например, NT AUTHORITY\СИСТЕМА), поэтому строка "SYSTEM" не подходит.
+        bool isLocalSystem = identity.User?.Value == "S-1-5-18";
+
         string body;
         using (var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8))
             body = reader.ReadToEnd();
@@ -220,7 +235,7 @@ internal static class Program
         {
             X509Certificate2 signed = req.kind switch
             {
-                "machine" => SignMachine(csrDer, req.names, caller, account, caCert, caKey),
+                "machine" => SignMachine(csrDer, req.names, caller, account, isLocalSystem, caCert, caKey),
                 "user" => SignUser(csrDer, req.upn, account, caCert, caKey),
                 _ => throw new InvalidOperationException("kind must be 'machine' or 'user'"),
             };
@@ -246,19 +261,16 @@ internal static class Program
     // ---------- подпись ----------
 
     private static X509Certificate2 SignMachine(byte[] csrDer, string[]? names, string caller, string account,
-        X509Certificate2 caCert, RSA caKey)
+        bool isLocalSystem, X509Certificate2 caCert, RSA caKey)
     {
         if (names is null || names.Length == 0 || string.IsNullOrWhiteSpace(names[0]))
             throw new InvalidOperationException("names is required for machine");
 
         // Запрос от локального SYSTEM (например, enrollment на самом ЦС) приходит как
-        // NT AUTHORITY\SYSTEM, а не как учётная запись компьютера. Тогда имя должно
-        // совпадать с именем машины, где работает ЦС.
-        bool localSystem = account.Equals("SYSTEM", StringComparison.OrdinalIgnoreCase)
-                           && caller.StartsWith("NT AUTHORITY", StringComparison.OrdinalIgnoreCase);
-
+        // NT AUTHORITY\СИСТЕМА (имя локализовано), а не как учётная запись компьютера.
+        // Тогда имя должно совпадать с именем машины, где работает ЦС.
         string machineShort;
-        if (localSystem)
+        if (isLocalSystem)
             machineShort = Environment.MachineName;
         else if (account.EndsWith('$'))
             machineShort = account.TrimEnd('$');

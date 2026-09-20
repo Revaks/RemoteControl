@@ -41,3 +41,7 @@ certs/
 installer/viewer/payload/
 installer/agent/RemoteControlAgent.exe
 *.msi
+
+# Installer staging for the CA payload (собирается build-single-msi.ps1)
+installer/ca/payload/
+installer/agent/enroll-cert.ps1

@@ -167,6 +167,44 @@ New-NetFirewallRule -DisplayName 'RemoteControl Lab CA (TCP 8555)' -Direction In
 
 ---
 
+## 5.2. Единый MSI (агент + автономный ЦС + консоль)
+
+Сборка: `installer\build-single-msi.ps1` → `dist\msi\RemoteControl.msi` (~69 МБ).
+Скрипт делает self-contained publish ЦС (`tools/labca`) и консоли, копирует агент и скрипты
+в `installer\{ca\payload,viewer\payload,agent}` и вызывает `wix build`.
+
+Установка (`msiexec /i RemoteControl.msi`) одной командой: служба агента + брандмауэр
+(5900/80/8555) + правила доступа в реестре + автономный мини-CA + задачи
+`RemoteControlLabCa` и `RemoteControlEnrollMachine` + выпуск машинного сертификата + консоль.
+
+**Грабли, на которые наступили:**
+
+- **WiX v5**: элементы `<CustomAction>` и `<InstallExecuteSequence>` должны лежать **внутри
+  `<Package>`** — в `<Fragment>` они молча игнорируются (MSI собирается без ошибок и предупреждений,
+  но таблица `CustomAction` остаётся пустой). Проверять так:
+  `SELECT Action,Type FROM CustomAction` через COM `WindowsInstaller.Installer`.
+- **WiX v5**: условие у `<Custom>` задаётся атрибутом `Condition="..."`, а не вложенным текстом
+  (иначе `error WIX0400: The Custom element contains illegal inner text`).
+- **Локализованный SYSTEM**: имя локального SYSTEM локализовано (`NT AUTHORITY\СИСТЕМА`),
+  поэтому сравнивать строку `"SYSTEM"` нельзя — в `labca` проверка идёт по SID `S-1-5-18`
+  (`identity.User?.Value == "S-1-5-18"`). Иначе enrollment с самого сервера падал с 403.
+- **`.cmd` только ASCII**: cmd.exe читает .cmd в OEM-кодировке, кириллические `rem`-комментарии
+  превращаются в мусорные команды. Все обёртки в `installer\agent\*.cmd` — ASCII.
+- **CIDR/URL ЦС**: `LABCA_PUBLIC_URL` по умолчанию больше не `dc1.corp.local`, а FQDN локальной
+  машины (`ResolvePublicUrl()`), иначе в CDP попадал чужой адрес; журнал ЦС переехал в
+  `C:\ProgramData\RemoteControl\labca.log`.
+- **Санитария при апгрейде**: `agent-cleanup.cmd` (deferred CA, `Before="RemoveFiles"`,
+  `REMOVE~="ALL"`) снимает задачи и убивает `labca.exe`, иначе занятый файл мешает удалению
+  старых файлов при major upgrade.
+
+**Проверка (20.09.2026, win11-host, версия MSI 1.2.2.0):** установка → служба `RemoteControlAgent`
+RUNNING, `/health` = ok, машинный сертификат `CN=WIN11HOST.corp.local` от **локального** ЦС
+(`Issuer=CN=RemoteControl Lab CA`, chain ok с online-проверкой отзыва), ярлыки консоли на месте;
+`enroll-user.cmd` выпустил клиентский `CN=administrator`, mTLS-подключение к 127.0.0.1:5900
+дало баннер `RFB 003.008`.
+
+---
+
 ## 6. Агент (C, Schannel + LibVNCServer)
 
 Исходники: `/home/UCBerkeley/Projects/RemoteControl/src/Agent` (хост) = `C:\Projects\RemoteControl\src\Agent` (VM).

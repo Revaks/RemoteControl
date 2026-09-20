@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Единый MSI Remote Control: агент + служба + брандмауэр + автономный мини-CA +
+  автовыпуск машинного сертификата + правила доступа в реестре + консоль оператора.
+
+  Сборка (см. installer/build-single-msi.ps1; cwd = installer\ ):
+    wix build RemoteControl.wxs -arch x64 -ext WixToolset.Firewall.wixext -o ..\dist\msi\RemoteControl.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="Remote Control"
+           Manufacturer="Revaks"
+           Version="1.2.2.0"
+           UpgradeCode="5E7C9A21-3B4D-4F68-9C2A-7D1E5B8F3A90"
+           Scope="perMachine"
+           Compressed="yes"
+           Codepage="1251">
+
+    <SummaryInformation Description="Remote Control: агент (mTLS + AD) и консоль оператора; автономный мини-CA и автовыпуск сертификатов" />
+
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия Remote Control." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch Condition="Installed OR VersionNT64" Message="Remote Control требует 64-битную Windows." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RemoteControl">
+        <Directory Id="CAPAYLOADDIR" Name="ca" />
+      </Directory>
+      <Directory Id="VIEWERFOLDER" Name="Remote Control Viewer" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="Remote Control" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Agent" Title="Remote Control Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+      <ComponentGroupRef Id="CaFiles" />
+      <ComponentGroupRef Id="CaFirewall" />
+      <ComponentGroupRef Id="EnrollFiles" />
+    </Feature>
+
+    <Feature Id="Viewer" Title="Remote Control Viewer" Level="1">
+      <ComponentGroupRef Id="ViewerPayload" />
+      <ComponentRef Id="ViewerShortcutsComponent" />
+    </Feature>
+
+    <!-- Настройка после копирования файлов и до старта службы агента.
+         ВНИМАНИЕ: в WiX v5 CustomAction/InstallExecuteSequence должны быть внутри
+         Package — в Fragment они молча игнорируются. -->
+    <CustomAction Id="RunAgentSetup"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="cmd.exe /c agent-setup.cmd"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <CustomAction Id="RunAgentCleanup"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="cmd.exe /c agent-cleanup.cmd"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RunAgentSetup" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="RunAgentCleanup" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+
+  <!-- Агент: файл, служба, брандмауэр 5900, правила доступа -->
+  <Fragment>
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+      <Component Id="AgentServiceComponent" Guid="B2E4C1A7-5F3D-4B91-8E6A-1C0D9F2B7A31">
+        <File Id="AgentExe"
+              Source="agent\RemoteControlAgent.exe"
+              KeyPath="yes" />
+
+        <ServiceInstall Id="AgentServiceInstall"
+                        Name="RemoteControlAgent"
+                        DisplayName="Remote Control Agent"
+                        Description="Агент удалённого управления: mTLS, авторизация по AD, RFB."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Vital="yes" />
+
+        <ServiceControl Id="AgentServiceControl"
+                        Name="RemoteControlAgent"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+
+        <fw:FirewallException Id="AgentFirewall"
+                              Name="Remote Control Agent (TCP 5900)"
+                              Description="Входящие подключения оператора к агенту удалённого управления."
+                              Port="5900"
+                              Protocol="tcp"
+                              Scope="any"
+                              IgnoreFailure="yes" />
+
+        <!-- Доступ: любой доменный пользователь (или локальный админ). -->
+        <RegistryValue Root="HKLM"
+                       Key="SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters"
+                       Name="ListenPort" Type="integer" Value="5900" KeyPath="no" />
+        <RegistryValue Root="HKLM"
+                       Key="SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters"
+                       Name="RequireClientCert" Type="integer" Value="1" KeyPath="no" />
+        <RegistryValue Root="HKLM"
+                       Key="SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters"
+                       Name="AllowLocalAdmins" Type="integer" Value="1" KeyPath="no" />
+        <RegistryValue Root="HKLM"
+                       Key="SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters"
+                       Name="AllowDomainUsers" Type="integer" Value="1" KeyPath="no" />
+
+        <RegistryValue Root="HKLM"
+                       Key="Software\Revaks\RemoteControl"
+                       Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="no" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Автономный мини-CA (self-contained publish) -->
+  <Fragment>
+    <ComponentGroup Id="CaFiles" Directory="CAPAYLOADDIR">
+      <Files Include="ca\payload\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Брандмауэр для ЦС: 80 (корень/CRL) и 8555 (enroll) -->
+  <Fragment>
+    <ComponentGroup Id="CaFirewall">
+      <Component Id="CaFirewallComponent" Directory="CAPAYLOADDIR" Guid="C3F5D2B8-6A4E-4C02-9F7B-2D1E0A3C8B42">
+        <RegistryValue Root="HKLM" Key="Software\Revaks\RemoteControl" Name="CaComponent"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <fw:FirewallException Id="CaHttpFirewall"
+                              Name="Remote Control Lab CA (TCP 80)"
+                              Description="Корневой сертификат и CRL мини-CA."
+                              Port="80" Protocol="tcp" Scope="any" IgnoreFailure="yes" />
+        <fw:FirewallException Id="CaEnrollFirewall"
+                              Name="Remote Control Lab CA (TCP 8555)"
+                              Description="Выпуск сертификатов мини-CA (enroll)."
+                              Port="8555" Protocol="tcp" Scope="any" IgnoreFailure="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Скрипты автовыпуска + ярлык для оператора -->
+  <Fragment>
+    <ComponentGroup Id="EnrollFiles" Directory="INSTALLFOLDER">
+      <Component Id="EnrollScriptsComponent" Guid="D4A6E3C9-7B5F-4D13-A08C-3E2F1B4D9C53">
+        <File Id="EnrollCertPs1" Source="agent\enroll-cert.ps1" KeyPath="yes" />
+      </Component>
+      <Component Id="AgentSetupComponent" Guid="E5B7F4DA-8C60-4E24-B19D-4F302C5EAD64">
+        <File Id="AgentSetupCmd" Source="agent\agent-setup.cmd" KeyPath="yes" />
+      </Component>
+      <Component Id="AgentCleanupComponent" Guid="1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D">
+        <File Id="AgentCleanupCmd" Source="agent\agent-cleanup.cmd" KeyPath="yes" />
+      </Component>
+      <Component Id="EnrollUserComponent" Guid="F6C805EB-9D71-4F35-C2AE-50413D6FBE75">
+        <File Id="EnrollUserCmd" Source="agent\enroll-user.cmd" KeyPath="yes" />
+
+        <Shortcut Id="StartMenuEnrollUser"
+                  Directory="AppShortcutFolder"
+                  Name="Получить сертификат оператора"
+                  Description="Выпустить клиентский сертификат у мини-CA (для подключения консолью)"
+                  Target="[INSTALLFOLDER]enroll-user.cmd"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="DesktopEnrollUser"
+                  Directory="DesktopFolder"
+                  Name="Получить сертификат оператора"
+                  Description="Выпустить клиентский сертификат у мини-CA (для подключения консолью)"
+                  Target="[INSTALLFOLDER]enroll-user.cmd"
+                  WorkingDirectory="INSTALLFOLDER" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Консоль оператора (self-contained publish) -->
+  <Fragment>
+    <ComponentGroup Id="ViewerPayload" Directory="VIEWERFOLDER">
+      <Files Include="viewer\payload\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <Component Id="ViewerShortcutsComponent" Directory="VIEWERFOLDER" Guid="A7D916FC-AE82-4A46-D3BF-61524E70CF86">
+      <RegistryValue Root="HKLM" Key="Software\Revaks\RemoteControlViewer" Name="InstallDir"
+                     Type="string" Value="[VIEWERFOLDER]" KeyPath="yes" />
+
+      <Shortcut Id="ViewerStartMenuShortcut"
+                Directory="AppShortcutFolder"
+                Name="Remote Control Viewer"
+                Description="Консоль оператора Remote Control"
+                Target="[VIEWERFOLDER]RemoteControl.Viewer.exe"
+                WorkingDirectory="VIEWERFOLDER" />
+      <Shortcut Id="ViewerDesktopShortcut"
+                Directory="DesktopFolder"
+                Name="Remote Control Viewer"
+                Description="Консоль оператора Remote Control"
+                Target="[VIEWERFOLDER]RemoteControl.Viewer.exe"
+                WorkingDirectory="VIEWERFOLDER" />
+    </Component>
+  </Fragment>
+</Wix>

@@ -16,14 +16,19 @@
 #>
 param(
     [ValidateSet('Machine', 'User')][string]$Kind = 'Machine',
-    [string]$CaUrl = 'http://dc1.corp.local/',
-    [string]$EnrollUrl = 'http://dc1.corp.local:8555/',
+    # Пусто = автономный режим: ЦС на этой же машине (по её FQDN).
+    [string]$CaUrl = '',
+    [string]$EnrollUrl = '',
     [string]$CaSubject = 'CN=RemoteControl Lab CA',
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
+$localFqdn = [System.Net.Dns]::GetHostEntry([System.Net.Dns]::GetHostName()).HostName
+if (-not $CaUrl) { $CaUrl = "http://$localFqdn/" }
+if (-not $EnrollUrl) { $EnrollUrl = "http://${localFqdn}:8555/" }
 $CaUrl = $CaUrl.TrimEnd('/')
+$EnrollUrl = $EnrollUrl.TrimEnd('/')
 
 # ---------- журнал ----------
 if ($Kind -eq 'Machine') {
