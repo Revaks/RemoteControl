@@ -1,0 +1,130 @@
+name: Release
+
+# По тегу вида v1.2.2 собираем MSI и публикуем релиз с ассетом.
+# Можно запустить и вручную (Actions -> Release -> Run workflow), указав тег.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для релиза (например, v1.2.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install WiX v5 + firewall extension
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add --global WixToolset.Firewall.wixext/5.0.2
+
+      - name: Build agent (CMake + MSVC)
+        shell: pwsh
+        run: |
+          cmake -S src/Agent -B build/agent -A x64
+          cmake --build build/agent --config Release
+
+      - name: Publish viewer (legacy packages)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          dotnet publish src/Viewer/RemoteControl.Viewer/RemoteControl.Viewer.csproj `
+            -c Release -r win-x64 --self-contained true -o dist/viewer-sc
+
+      - name: Build single MSI (agent + CA + viewer)
+        shell: pwsh
+        run: |
+          ./installer/build-single-msi.ps1
+
+      - name: Build legacy MSIs (optional)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          ./installer/build-msi.ps1
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem dist/msi -Filter *.msi | ForEach-Object {
+            "{0,-32} {1,10:N1} MB" -f $_.Name, ($_.Length / 1MB)
+          }
+          if (-not (Test-Path dist/msi/RemoteControl.msi)) { throw 'RemoteControl.msi не собран' }
+
+      - name: Resolve tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { $env:GITHUB_REF_NAME }
+          if (-not $tag) { throw 'не удалось определить тег' }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "tag: $tag"
+
+      - name: Publish release with MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $assets = @(Get-ChildItem dist/msi -Filter *.msi | ForEach-Object { $_.FullName })
+          $notes = @'
+          ## Единый MSI
+
+          `RemoteControl.msi` — один установщик, которого достаточно поставить на сервер.
+          Он ставит **агент, автономный мини-CA и консоль оператора** и сразу выпускает
+          машинный сертификат агенту — дальше удалённый доступ работает без ручных шагов.
+
+          ```powershell
+          msiexec /i RemoteControl.msi /qn /l*v rc-msi.log
+          ```
+
+          | Что делает | Детали |
+          |---|---|
+          | Агент | `RemoteControlAgent.exe` + служба `RemoteControlAgent` (автостарт), брандмауэр TCP 5900 |
+          | Мини-CA | `ca\labca.exe`, задача `RemoteControlLabCa` (SYSTEM, at startup), брандмауэр TCP 80/8555 |
+          | Машинный сертификат | задача `RemoteControlEnrollMachine` + выпуск сразу при установке |
+          | Правила доступа | `ListenPort=5900`, `RequireClientCert=1`, `AllowLocalAdmins=1`, `AllowDomainUsers=1` |
+          | Консоль оператора | `C:\Program Files\Remote Control Viewer` + ярлыки |
+
+          **Оператору** (на своей машине): `msiexec /i RemoteControl.msi ADDLOCAL=Viewer`, затем взять
+          сертификат у ЦС того сервера, к которому будет подключение:
+
+          ```powershell
+          & 'C:\Program Files\RemoteControl\enroll-user.cmd' -CaUrl http://<server>/ -EnrollUrl http://<server>:8555/
+          ```
+
+          Подробная инструкция — `docs/INSTALL.md`.
+
+          > ⚠️ По умолчанию включён `AllowDomainUsers=1`: подключаться сможет любой пользователь домена.
+          > Сузить доступ: `scripts\configure-agent.ps1 -AllowedGroups @("CN=...") -AllowDomainUsers $false`.
+          '@
+          $notes | Out-File -FilePath release-notes.md -Encoding utf8
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Remote Control $tag" --notes-file release-notes.md
+          }
+          if ($LASTEXITCODE -ne 0) { throw "не удалось опубликовать релиз $tag" }
+          gh release view $tag --json tagName,assets --jq '.tagName + " -> " + ([.assets[].name] | join(", "))'
