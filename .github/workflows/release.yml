@@ -39,59 +39,60 @@ jobs:
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add --global WixToolset.Firewall.wixext/5.0.2
 
-      # На раннере CMake 4.x, а LibVNCServer 0.9.14 под него не конфигурируется
-      # (CMake 4 убрал совместимость с cmake_minimum_required < 3.5).
-      - name: Pin CMake 3.x
+      # Собираем через MSVC-окружение + Ninja, а не через генератор "Visual Studio NN YYYY":
+      # на windows-latest версия VS меняется, и генератор может быть неизвестен CMake
+      # (CMake Error: could not find any instance of Visual Studio).
+      # CMake держим 3.x: LibVNCServer 0.9.14 (cmake_minimum_required < 3.5) под CMake 4.x не идёт.
+      - name: Pin CMake 3.x + Ninja
         shell: pwsh
         run: |
-          python -m pip install --quiet --disable-pip-version-check "cmake==3.29.6"
+          python -m pip install --quiet --disable-pip-version-check "cmake==3.29.6" "ninja==1.11.1.1"
           $scripts = (python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
-          $exe = Join-Path $scripts 'cmake.exe'
-          if (-not (Test-Path $exe)) { throw "cmake не найден: $exe" }
-          "CMAKE_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & $exe --version | Select-Object -First 1
+          $cmake = Join-Path $scripts 'cmake.exe'
+          $ninja = Join-Path $scripts 'ninja.exe'
+          if (-not (Test-Path $cmake)) { throw "cmake не найден: $cmake" }
+          if (-not (Test-Path $ninja)) { throw "ninja не найден: $ninja" }
+          "CMAKE_EXE=$cmake" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "NINJA_EXE=$ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $cmake --version | Select-Object -First 1
 
-      - name: Build agent (CMake + MSVC)
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build agent (CMake + Ninja + MSVC)
         shell: pwsh
         run: |
-          & $env:CMAKE_EXE --version | Select-Object -First 1
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $vswhere) {
+            $vs = (& $vswhere -all -products * -property displayName) -join '; '
+            Write-Host "::notice::Visual Studio: $vs"
+          }
+          Write-Host "::notice::cl: $((Get-Command cl.exe -ErrorAction SilentlyContinue).Source)"
 
-          # Собираем хвост ошибки так, чтобы в аннотацию попал текст CMake Error, а не только
-          # последние строки про проверки типов.
-          function Get-ErrTail([string]$Path) {
-            if (-not (Test-Path $Path)) { return '' }
-            $err = (Select-String -Path $Path -Pattern 'CMake Error' -Context 0, 10 |
+          & $env:CMAKE_EXE -S src/Agent -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=$env:NINJA_EXE 2>&1 |
+            Tee-Object -FilePath cfg.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Select-String -Path cfg.log -Pattern 'CMake Error' -Context 0, 10 |
                     Select-Object -First 2 |
                     ForEach-Object { @($_.Line) + @($_.Context.PostContext) }) -join '%0A'
-            if (-not $err) { $err = ((Get-Content $Path -Tail 25) -join '%0A') }
-            return $err
-          }
-
-          & $env:CMAKE_EXE -S src/Agent -B build/agent -G "Visual Studio 17 2022" -A x64 2>&1 | Tee-Object -FilePath cfg1.log
-          $ok = ($LASTEXITCODE -eq 0)
-          if (-not $ok) {
-            # CMake 4.x убрал совместимость с cmake_minimum_required < 3.5 (LibVNCServer 0.9.14).
-            Write-Host '::warning::первый configure упал, повторяю с CMAKE_POLICY_VERSION_MINIMUM=3.5'
-            Remove-Item build/agent -Recurse -Force -ErrorAction SilentlyContinue
-            & $env:CMAKE_EXE -S src/Agent -B build/agent -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
-            $ok = ($LASTEXITCODE -eq 0)
-          }
-          if (-not $ok) {
-            $tail = Get-ErrTail 'cfg2.log'
-            if (-not $tail) { $tail = Get-ErrTail 'cfg1.log' }
-            Write-Host "::error title=cmake configure failed::$tail"
+            if (-not $err) { $err = ((Get-Content cfg.log -Tail 25) -join '%0A') }
+            Write-Host "::error title=cmake configure failed::$err"
             exit 1
           }
 
-          & $env:CMAKE_EXE --build build/agent --config Release 2>&1 | Tee-Object -FilePath build.log
+          & $env:CMAKE_EXE --build build/agent 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
-            $err = (Select-String -Path build.log -Pattern 'error C|error MSB|fatal error' -Context 0, 2 |
+            $err = (Select-String -Path build.log -Pattern 'error C|error MSB|fatal error|ninja: build stopped' -Context 0, 3 |
                     Select-Object -First 4 |
                     ForEach-Object { @($_.Line) + @($_.Context.PostContext) }) -join '%0A'
             if (-not $err) { $err = ((Get-Content build.log -Tail 25) -join '%0A') }
             Write-Host "::error title=agent build failed::$err"
             exit 1
           }
+
+          Get-Item build/agent/RemoteControlAgent.exe | ForEach-Object { "агент: $($_.FullName) ($($_.Length) байт)" }
 
       - name: Publish viewer (legacy packages)
         shell: pwsh
@@ -103,10 +104,11 @@ jobs:
       - name: Build single MSI (agent + CA + viewer)
         shell: pwsh
         run: |
-          ./installer/build-single-msi.ps1 2>&1 | Tee-Object -FilePath msi.log
+          ./installer/build-single-msi.ps1 -AgentExe "$PWD/build/agent/RemoteControlAgent.exe" 2>&1 |
+            Tee-Object -FilePath msi.log
           if ($LASTEXITCODE -ne 0) {
-            $tail = ((Get-Content msi.log -Tail 20) -join '%0A')
-            Write-Host "::error title=MSI build failed::$tail"
+            $err = ((Get-Content msi.log -Tail 25) -join '%0A')
+            Write-Host "::error title=MSI build failed::$err"
             exit 1
           }
 
@@ -114,7 +116,7 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          ./installer/build-msi.ps1
+          ./installer/build-msi.ps1 -AgentExe "$PWD/build/agent/RemoteControlAgent.exe" -ViewerPublishDir "$PWD/dist/viewer-sc"
 
       - name: Collect artifacts
         shell: pwsh
