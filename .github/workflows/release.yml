@@ -67,13 +67,13 @@ jobs:
             return $err
           }
 
-          & $env:CMAKE_EXE -S src/Agent -B build/agent -A x64 2>&1 | Tee-Object -FilePath cfg1.log
+          & $env:CMAKE_EXE -S src/Agent -B build/agent -G "Visual Studio 17 2022" -A x64 2>&1 | Tee-Object -FilePath cfg1.log
           $ok = ($LASTEXITCODE -eq 0)
           if (-not $ok) {
             # CMake 4.x убрал совместимость с cmake_minimum_required < 3.5 (LibVNCServer 0.9.14).
             Write-Host '::warning::первый configure упал, повторяю с CMAKE_POLICY_VERSION_MINIMUM=3.5'
             Remove-Item build/agent -Recurse -Force -ErrorAction SilentlyContinue
-            & $env:CMAKE_EXE -S src/Agent -B build/agent -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
+            & $env:CMAKE_EXE -S src/Agent -B build/agent -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
             $ok = ($LASTEXITCODE -eq 0)
           }
           if (-not $ok) {
