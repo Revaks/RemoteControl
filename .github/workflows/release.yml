@@ -53,8 +53,10 @@ jobs:
           if (-not (Test-Path $cmake)) { throw "cmake не найден: $cmake" }
           if (-not (Test-Path $ninja)) { throw "ninja не найден: $ninja" }
           "CMAKE_EXE=$cmake" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "NINJA_EXE=$ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # ninja кладём в PATH: иначе CMake не находит его для генератора Ninja
+          $scripts | Out-File -FilePath $env:GITHUB_PATH -Append
           & $cmake --version | Select-Object -First 1
+          & $ninja --version
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -71,7 +73,8 @@ jobs:
           }
           Write-Host "::notice::cl: $((Get-Command cl.exe -ErrorAction SilentlyContinue).Source)"
 
-          & $env:CMAKE_EXE -S src/Agent -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=$env:NINJA_EXE 2>&1 |
+          ninja --version
+          & $env:CMAKE_EXE -S src/Agent -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 |
             Tee-Object -FilePath cfg.log
           if ($LASTEXITCODE -ne 0) {
             $err = (Select-String -Path cfg.log -Pattern 'CMake Error' -Context 0, 10 |
