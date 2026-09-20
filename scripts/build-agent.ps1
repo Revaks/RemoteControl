@@ -1,4 +1,4 @@
-# Сборка агента под Windows (Visual Studio + CMake).
+﻿# Сборка агента под Windows (Visual Studio + CMake).
 # Требуется: cmake, Visual Studio 2022 (C++ workload) или Build Tools.
 # LibVNCServer либо подтянется с GitHub, либо укажите локальный исходник.
 param(

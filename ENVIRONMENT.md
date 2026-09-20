@@ -21,8 +21,11 @@
 Учётные данные:
 
 - Локальный/доменный администратор: `CORP\Administrator` / `LabAdmin!2026`
-- Тестовый пользователь: `rctest@corp.local` / пароль `LabAdmin!2026`
-- Клиентский сертификат `rctest` лежит в `CurrentUser\My` у пользователя Administrator на VM (и в `C:\Setup\client-rctest.pfx`)
+- Тестовый пользователь (член AD-группы `Remote Control Operators`): `rctest@corp.local` / пароль `LabAdmin!2026`
+- Локальный администратор без AD-группы операторов: `CORP\locadmin` / пароль `RcLab#2026!Secure`
+  (входит в `BUILTIN\Administrators`, но не в `Remote Control Operators` — на нём проверяется правило `AllowLocalAdmins`)
+- Клиентские сертификаты `rctest` и `locadmin` лежат в `CurrentUser\My` у пользователя Administrator на VM
+  (и в `C:\Setup\client-rctest.pfx`, `C:\Setup\client-locadmin.pfx`; пароль контейнера — `LabAdmin!2026`)
 
 Вторая VM (`win11-host`):
 
@@ -170,7 +173,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\redeploy2.ps1
 - `service.c`: relay-потоки без отладочных логов (события 1490–1495 были временными); выбор helper'а по блокировке консоли (событие 1406).
 - `session.c`: парсинг аргументов с `argv[0]` (в `WinMain` `lpCmdLine` не содержит имени exe); `listenInterface = inet_addr(...)` (в LibVNCServer 0.9.14 это `in_addr_t`, не строка); `rfbInitServer` возвращает void → проверка через `rfbIsActive`; режим `--secure` для захвата Winlogon (события 1320–1324).
 - `agent_main.c`: `--session` **и** `--secure` диспатчатся в `session_run` (иначе `--secure` уходил в `service_run` и мгновенно выходил по мутексу).
-- `auth.c`: LDAP-поиск с базой `defaultNamingContext` из RootDSE.
+- `auth.c`: LDAP-поиск с базой `defaultNamingContext` из RootDSE. **Правило `AllowLocalAdmins`** (реестр `...\Parameters\AllowLocalAdmins`, DWORD, по умолчанию 1): доступ разрешается учётке, входящей в локальную группу Administrators этой машины, даже если её нет в `AllowedGroups`; проверка через SAM/RPC `NetUserGetLocalGroups`, SAM-имя берётся обратным преобразованием `LookupAccountNameW` → `LookupAccountSidW` (UPN ≠ sAMAccountName; до этого `fullAccount` собирался с неинициализированным `account`). Правило срабатывает и когда UPN вообще не найден в AD. События 1206 (разрешено), 1207/1208 (ошибки SAM), 1209 (нет `AllowedGroups` и не локальный админ), 1214 (`LookupAccountSidW`). Настройка: `configure-agent.ps1 -AllowLocalAdmins $true|$false`.
 - `capture.c`: `BitBlt(SRCCOPY | CAPTUREBLT)`; в secure-режиме источник — `CreateDC("DISPLAY")`, а не `GetDC(NULL)` (событие 1330 при ошибке BitBlt). **Курсор мыши дорисовывается поверх кадра** (`GetCursorInfo` + `DrawIconEx`), т.к. BitBlt сам курсор не захватывает. **Убран отдельный буфер `s_prevBits` и полнокадровый `memcmp`** (агент падал с 0xc0000005 в `VCRUNTIME140.dll`, viewer получал `EndOfStreamException`); сравнение с предыдущим кадром теперь идёт построчно прямо при копировании во фреймбуфер LibVNCServer. **`capture_screen` возвращает ограничивающий прямоугольник изменённых пикселей** — клиенту уходит только грязная область, а не весь экран.
 - `capture.c` + `dxgi_capture.c` (агент): захват в отдельном потоке, следящем за активным рабочим столом. **DXGI Desktop Duplication** (`dxgi_capture.c`, D3D11 + `IDXGIOutputDuplication`, пересоздание при `ACCESS_LOST`; события 1350/1351/1362) для обычного стола, GDI `BitBlt(SRCCOPY | CAPTUREBLT)` как фолбэк и для защищённого стола (`CreateDC("DISPLAY")`). **Курсор мыши дорисовывается поверх кадра** (`GetCursorInfo` + `DrawIconEx`; на VM курсор может быть `CURSOR_SUPPRESSED` — тогда не рисуем, как и сама ОС). **Убран отдельный буфер `s_prevBits` и полнокадровый `memcmp`** (агент падал с 0xc0000005 в `VCRUNTIME140.dll`, viewer получал `EndOfStreamException`); сравнение идёт построчно при копировании, заодно считается **ограничивающий прямоугольник изменений** — клиенту уходит только грязная область.
 - `input.c` (агент): RFB-колбэки только кладут события в очередь, `SendInput` выполняет поток захвата (привязан к активному рабочему столу) — иначе ввод не доходит до UAC/экрана блокировки. Печатаемые символы шлются как Unicode-символы (`KEYEVENTF_UNICODE`: регистр/раскладка как на клиенте), а непечатаемые (Enter, Tab, стрелки, Win) и акселераторы при зажатом Ctrl/Alt — **скан-кодом** (`fill_vk`: `KEYEVENTF_SCANCODE` + `MapVirtualKey`). Инъекция только через `wVk` (с нулевым `wScan`) возвращала `SendInput == 1`, но клавиши не срабатывали — перешли на скан-код. SAS: keysym `0xFFFFFF00` → `SendSAS(FALSE)` из `sas.dll` с предварительно включённой привилегией `SeTcbPrivilege`. Диагностика — см. §7.2.
@@ -325,13 +328,43 @@ timeout 25 openssl s_client -connect 192.168.122.10:5900 -CAfile /tmp/lab-root.p
 # handshake должен быть отклонён, служба остаётся RUNNING
 ```
 
+### Тест правила AllowLocalAdmins (локальный админ без AD-группы)
+
+`locadmin` — доменная учётка, которая входит в `BUILTIN\Administrators`, но **не** в
+`Remote Control Operators`; `rctest` — наоборот, член группы операторов.
+
+```bash
+# оба клиентских сертификата (пароль контейнера LabAdmin!2026)
+for n in rctest locadmin; do
+  openssl pkcs12 -in /tmp/client-$n.pfx -clcerts -nokeys -passin pass:LabAdmin!2026 -out /tmp/$n.crt
+  openssl pkcs12 -in /tmp/client-$n.pfx -nocerts -nodes -passin pass:LabAdmin!2026 -out /tmp/$n.key
+done
+
+# AllowLocalAdmins=1: locadmin → RFB 003.008 (событие 1206), rctest → RFB 003.008 (событие 1204)
+( sleep 6 ) | timeout 12 openssl s_client -connect 192.168.122.10:5900 \
+  -cert /tmp/locadmin.crt -key /tmp/locadmin.key -CAfile /tmp/lab-root.pem -no_ign_eof
+```
+
+Отключить правило и убедиться, что доступ пропадает только у `locadmin`:
+
+```powershell
+# на VM
+.\scripts\configure-agent.ps1 -AllowedGroups @("CN=Remote Control Operators,OU=Groups,DC=corp,DC=local") -AllowLocalAdmins $false
+# locadmin → соединение закрывается без RFB, события 1401/1205; rctest → по-прежнему RFB 003.008
+# вернуть как было:
+.\scripts\configure-agent.ps1 -AllowedGroups @("CN=Remote Control Operators,OU=Groups,DC=corp,DC=local") -AllowLocalAdmins $true
+```
+
+Проверено 20.09.2026: `AllowLocalAdmins=1` → `locadmin` разрешён (1206), `rctest` разрешён (1204);
+`AllowLocalAdmins=0` → `locadmin` отклонён (1401/1205), `rctest` разрешён (1204).
+
 ### События агента (Application log)
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\allevents.ps1
 ```
 
-Ключевые ID: `1204` доступ разрешён, `1102` нет клиентского сертификата, `1402` подключение, `1302` helper слушает, `1404` ретрансляция, `1405` сеанс завершён, `1406` консоль заблокирована → захват Winlogon, `1324` secure-helper захватывает Winlogon, `1320`/`1321`/`1322`/`1323` проблемы запуска secure-helper, `1330` ошибка BitBlt.
+Ключевые ID: `1204` доступ разрешён по AD-группе, `1205` доступ запрещён, `1206` доступ разрешён локальному администратору машины, `1102` нет клиентского сертификата, `1402` подключение, `1302` helper слушает, `1404` ретрансляция, `1405` сеанс завершён, `1406` консоль заблокирована → захват Winlogon, `1324` secure-helper захватывает Winlogon, `1320`/`1321`/`1322`/`1323` проблемы запуска secure-helper, `1330` ошибка BitBlt. Проверка локального админа: `1207`/`1208`/`1214` ошибки SAM, `1209` нет `AllowedGroups` и не локальный админ.
 
 ### Стресс-тест параллельного ввода (защита от вылетов консоли)
 

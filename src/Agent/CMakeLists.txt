@@ -57,5 +57,8 @@ if(TARGET vncserver)
 endif()
 
 if(MSVC)
-    target_compile_options(RemoteControlAgent PRIVATE /W3)
+    # /W3 — обычные предупреждения.
+    # /utf-8 — все исходники в UTF-8 без BOM; без него MSVC читает их в ANSI-кодировке
+    # системы и кириллица в L"..." (сообщения Event Log) попадает искажённой.
+    target_compile_options(RemoteControlAgent PRIVATE /W3 /utf-8)
 endif()

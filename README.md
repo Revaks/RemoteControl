@@ -115,13 +115,25 @@ HKLM\SYSTEM\CurrentControlSet\Services\RemoteControlAgent\Parameters
   ListenPort         REG_DWORD     порт (по умолчанию 5900)
   RequireClientCert  REG_DWORD     1 = требовать клиентский сертификат
   AllowedGroups      REG_MULTI_SZ  DN групп AD, которым разрешён доступ
+  AllowLocalAdmins   REG_DWORD     1 = разрешить доступ локальным администраторам машины (по умолчанию 1)
 ```
 
 ```powershell
 .\scripts\configure-agent.ps1 -AllowedGroups @("CN=Remote Control Operators,OU=Groups,DC=corp,DC=local")
 ```
 
-Если `AllowedGroups` не задан, доступ разрешается любому доменному сертификату — **только для лаборатории**.
+Правила доступа:
+
+- если задан `AllowedGroups` — доступ получают члены перечисленных групп AD (проверка через LDAP);
+- правило `AllowLocalAdmins` (включено по умолчанию) дополнительно разрешает доступ учётной
+  записи, входящей в **локальную группу Administrators этой машины**, даже если она не состоит
+  в `AllowedGroups`. Проверка идёт через SAM/RPC (`NetUserGetLocalGroups`), членство в AD-группах
+  не требуется — это и есть подключение «локального админа без доступа к AD-группам». Если такой
+  пользователь вообще не найден в AD, правило всё равно срабатывает (последний шанс);
+- если `AllowedGroups` не задан, а `AllowLocalAdmins=1` — доступ получают **только** локальные
+  администраторы машины;
+- если не задан `AllowedGroups` и `AllowLocalAdmins=0` — доступ разрешается любому доменному
+  сертификату, **только для лаборатории**.
 
 Машинный сертификат агента (`LocalMachine\My`, EKU Server Auth) должен иметь закрытый ключ,
 доступный SYSTEM.

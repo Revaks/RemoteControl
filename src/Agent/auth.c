@@ -4,6 +4,7 @@
 
 #include <winldap.h>
 #include <dsgetdc.h>
+#include <lm.h>          // NetUserGetLocalGroups, LOCALGROUP_USERS_INFO_0
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,102 @@ static wchar_t* read_allowed_groups(void)
     return groups;
 }
 
+// ---------- локальные администраторы ----------
+
+// Читает DWORD AllowLocalAdmins. Значение отсутствует — правило включено.
+static int read_allow_local_admins(void)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, RC_REG_PARAMETERS_KEY, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return 1;
+
+    DWORD value = 1, size = sizeof(value), type = 0;
+    if (RegQueryValueExW(key, RC_REG_VALUE_ALLOW_LOCAL_ADMINS, NULL, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD)
+    {
+        value = 1;
+    }
+
+    RegCloseKey(key);
+    return value != 0;
+}
+
+// Проверяет, входит ли доменный пользователь (по UPN из сертификата) в локальную
+// группу Administrators ЭТОЙ машины. Это альтернатива членству в AllowedGroups:
+// локальный администратор машины имеет право подключаться к ней без AD-группы.
+// Проверка идёт через SAM/RPC (NetUserGetLocalGroups), а не через LDAP.
+static int is_local_admin(const wchar_t* upn)
+{
+    // 1. UPN -> SID (для доменной учётки UPN разрешает контроллер домена).
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD sidLen = sizeof(sid);
+    wchar_t domain[256];
+    DWORD domainLen = _countof(domain);
+    SID_NAME_USE use;
+
+    if (!LookupAccountNameW(NULL, upn, sid, &sidLen, domain, &domainLen, &use))
+    {
+        rc_event_log(EVENTLOG_WARNING_TYPE, 1207,
+            L"Локальный админ: LookupAccountNameW(%s) failed: %lu", upn, GetLastError());
+        return 0;
+    }
+
+    // LookupAccountNameW отдаёт SID и домен, но НЕ SAM-имя. Получаем его обратным
+    // преобразованием SID -> DOMAIN\account: UPN может отличаться от sAMAccountName,
+    // а NetUserGetLocalGroups принимает именно DOMAIN\account.
+    wchar_t account[256];
+    DWORD accountLen = _countof(account);
+    domainLen = _countof(domain);
+    if (!LookupAccountSidW(NULL, sid, account, &accountLen, domain, &domainLen, &use))
+    {
+        rc_event_log(EVENTLOG_WARNING_TYPE, 1214,
+            L"Локальный админ: LookupAccountSidW(%s) failed: %lu", upn, GetLastError());
+        return 0;
+    }
+
+    wchar_t fullAccount[512];
+    swprintf_s(fullAccount, _countof(fullAccount), L"%s\\%s", domain, account);
+
+    // 2. Локализованное имя группы Administrators (S-1-5-32-544).
+    BYTE adminSid[SECURITY_MAX_SID_SIZE];
+    DWORD adminSidLen = sizeof(adminSid);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSid, &adminSidLen))
+        return 0;
+
+    wchar_t adminName[256];
+    DWORD adminNameLen = _countof(adminName);
+    wchar_t adminDomain[256];
+    DWORD adminDomainLen = _countof(adminDomain);
+    if (!LookupAccountSidW(NULL, adminSid, adminName, &adminNameLen, adminDomain, &adminDomainLen, &use))
+        return 0;
+
+    // 3. Локальные группы пользователя; LG_INCLUDE_INDIRECT учитывает членство
+    //    через доменные группы (например, CORP\Domain Admins).
+    LOCALGROUP_USERS_INFO_0* groups = NULL;
+    DWORD read = 0, total = 0;
+    NET_API_STATUS st = NetUserGetLocalGroups(NULL, fullAccount, 0, LG_INCLUDE_INDIRECT,
+        (LPBYTE*)&groups, MAX_PREFERRED_LENGTH, &read, &total);
+    if (st != NERR_Success)
+    {
+        rc_event_log(EVENTLOG_WARNING_TYPE, 1208,
+            L"Локальный админ: NetUserGetLocalGroups(%s): %lu", fullAccount, (unsigned long)st);
+        return 0;
+    }
+
+    int found = 0;
+    for (DWORD i = 0; i < read; i++)
+    {
+        if (_wcsicmp(groups[i].lgrui0_name, adminName) == 0)
+        {
+            found = 1;
+            break;
+        }
+    }
+
+    NetApiBufferFree(groups);
+    return found;
+}
+
 // ---------- основная проверка ----------
 
 int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLen)
@@ -115,12 +212,31 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
     wcsncpy_s(upn, upnLen, tmp, _TRUNCATE);
     free(tmp);
 
-    // 2. Список разрешённых групп из реестра.
+    // 2. Правила доступа: список разрешённых групп AD + правило локального админа.
+    int allowLocalAdmins = read_allow_local_admins();
     wchar_t* groups = read_allowed_groups();
     if (groups == NULL || groups[0] == L'\0')
     {
-        // Группы не настроены: доступ по факту предъявления сертификата домена.
-        // Для продакшена обязательно настроить AllowedGroups через GPO/реестр.
+        // AllowedGroups не задан. Если правило локальных админов включено —
+        // доступ получают только локальные администраторы этой машины.
+        if (allowLocalAdmins)
+        {
+            if (is_local_admin(upn))
+            {
+                rc_event_log(EVENTLOG_INFORMATION_TYPE, 1206,
+                    L"Доступ разрешён: UPN=%s, локальный администратор машины (AllowedGroups не настроен)", upn);
+                free(groups);
+                return 0;
+            }
+
+            rc_event_log(EVENTLOG_WARNING_TYPE, 1209,
+                L"AllowedGroups не настроен — доступ только локальным администраторам. Отказано: UPN=%s", upn);
+            free(groups);
+            return -1;
+        }
+
+        // Правило локальных админов выключено и группы не заданы — прежнее поведение
+        // (доступ по факту предъявления сертификата домена). Для продакшена не рекомендуется.
         rc_event_log(EVENTLOG_WARNING_TYPE, 1201,
             L"AllowedGroups не настроен — доступ разрешён любому сертификату домена. UPN=%s", upn);
         free(groups);
@@ -234,7 +350,19 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
         LDAPMessage* entry = ldap_first_entry(ld, res);
         if (entry == NULL)
         {
-            rc_event_log(EVENTLOG_ERROR_TYPE, 1203, L"Пользователь %s не найден в AD", upn);
+            // Учётной записи с таким UPN в AD нет (например, локальная учётка машины).
+            // Правило AllowLocalAdmins — последний шанс получить доступ.
+            if (allowLocalAdmins && is_local_admin(upn))
+            {
+                result = 0;
+                rc_event_log(EVENTLOG_INFORMATION_TYPE, 1206,
+                    L"Доступ разрешён: UPN=%s, локальный администратор машины (в AD не найден)", upn);
+            }
+            else
+            {
+                rc_event_log(EVENTLOG_ERROR_TYPE, 1203, L"Пользователь %s не найден в AD", upn);
+            }
+
             ldap_msgfree(res);
             goto cleanup;
         }
@@ -254,6 +382,15 @@ int auth_check_certificate(PCCERT_CONTEXT clientCert, wchar_t* upn, size_t upnLe
                 break;
             }
             g += wcslen(g) + 1;
+        }
+
+        // Альтернатива AD-группе: доменный пользователь, который входит в локальную
+        // группу Administrators этой машины (правило AllowLocalAdmins, включено по умолчанию).
+        if (result != 0 && allowLocalAdmins && is_local_admin(upn))
+        {
+            result = 0;
+            rc_event_log(EVENTLOG_INFORMATION_TYPE, 1206,
+                L"Доступ разрешён: UPN=%s, локальный администратор машины", upn);
         }
 
         if (result != 0)

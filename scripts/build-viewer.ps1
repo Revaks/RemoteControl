@@ -1,4 +1,4 @@
-# Сборка консоли оператора (WPF, .NET 8) под Windows.
+﻿# Сборка консоли оператора (WPF, .NET 8) под Windows.
 param(
     [string]$Configuration = "Release"
 )
