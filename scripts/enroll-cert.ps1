@@ -61,14 +61,44 @@ function Test-Admin {
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Действующий сертификат, выпущенный НАШИМ CA, с нужным CN и EKU уже установлен?
-function Test-ExistingCert([string]$Location, [string]$CnMatch, [string]$EkuOid, [string]$IssuerMatch) {
+# Идентификатор ключа из расширения: SKI (2.5.29.14, OCTET STRING) или AKI (2.5.29.35, [0] keyIdentifier).
+function Get-KeyIdBytes($Extension) {
+    if (-not $Extension) { return $null }
+    $d = $Extension.RawData
+    for ($i = 0; $i -lt $d.Length - 1; $i++) {
+        if ($d[$i] -eq 0x04 -or $d[$i] -eq 0x80) {
+            $len = [int]$d[$i + 1]
+            if ($len -gt 0 -and ($i + 2 + $len) -le $d.Length) { return $d[($i + 2)..($i + 1 + $len)] }
+        }
+    }
+    return $null
+}
+
+function Test-KeyIdEqual($a, $b) {
+    if ($null -eq $a -or $null -eq $b) { return $false }
+    if ($a.Length -ne $b.Length) { return $false }
+    for ($i = 0; $i -lt $a.Length; $i++) { if ($a[$i] -ne $b[$i]) { return $false } }
+    return $true
+}
+
+# Действующий сертификат, выпущенный ИМЕННО ЭТИМ CA, с нужным CN и EKU уже установлен?
+# ЦС опознаём по ключу: у автономных мини-CA одинаковый subject (CN=RemoteControl Lab CA),
+# поэтому сравнение строки Issuer давало ложное «уже есть».
+function Test-ExistingCert([string]$Location, [string]$CnMatch, [string]$EkuOid, $Root) {
+    $rootKeyId = Get-KeyIdBytes (($Root.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.14' } | Select-Object -First 1))
     $store = Open-CertStore 'My' $Location $false
     try {
         foreach ($c in $store.Certificates) {
             if (-not $c.HasPrivateKey) { continue }
             if ($c.NotAfter -lt (Get-Date).AddDays(30)) { continue }
-            if ($c.Issuer -ne $IssuerMatch) { continue }
+
+            $certKeyId = Get-KeyIdBytes (($c.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.35' } | Select-Object -First 1))
+            if ($null -ne $rootKeyId) {
+                if (-not (Test-KeyIdEqual $certKeyId $rootKeyId)) { continue }
+            } elseif ($c.Issuer -ne $Root.Subject) {
+                continue
+            }
+
             $cn = $c.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
             if ($cn -ne $CnMatch) { continue }
             foreach ($ext in $c.Extensions) {
@@ -83,13 +113,29 @@ function Test-ExistingCert([string]$Location, [string]$CnMatch, [string]$EkuOid,
     return $false
 }
 
+function Test-RootPresent([string]$Location, [string]$Thumbprint) {
+    $store = Open-CertStore 'Root' $Location $false
+    try {
+        foreach ($c in $store.Certificates) { if ($c.Thumbprint -eq $Thumbprint) { return $true } }
+    } finally { $store.Close() }
+    return $false
+}
+
 function Add-TrustedRoot([string]$Location, $Cert) {
+    if (Test-RootPresent $Location $Cert.Thumbprint) { return }
     $store = Open-CertStore 'Root' $Location $true
     try {
-        $exists = $false
-        foreach ($c in $store.Certificates) { if ($c.Thumbprint -eq $Cert.Thumbprint) { $exists = $true; break } }
-        if (-not $exists) { $store.Add($Cert) }
+        # На части систем Add в CurrentUser\Root отдаёт «The request is not supported»,
+        # хотя сертификат фактически добавляется — поэтому проверяем результат, а не исключение.
+        try {
+            $store.Add($Cert)
+        } catch {
+            Write-Log "Add в $Location\Root: $($_.Exception.Message)"
+        }
     } finally { $store.Close() }
+
+    if (Test-RootPresent $Location $Cert.Thumbprint) { return }
+    throw "не удалось добавить корневой сертификат в $Location\Root"
 }
 
 try {
@@ -124,11 +170,6 @@ try {
 
     Write-Log "start kind=$Kind cn=$cn ca=$CaUrl"
 
-    if (-not $Force -and (Test-ExistingCert $storeLocation $cn $eku $CaSubject)) {
-        Write-Log 'действующий сертификат уже есть — выход'
-        exit 0
-    }
-
     # ---------- 2. Корневой CA в доверенные ----------
     $rootPath = Join-Path $env:TEMP 'rc-ca.cer'
     $root = $null
@@ -150,7 +191,13 @@ try {
         if (Test-Admin) { Add-TrustedRoot 'LocalMachine' $root }
     }
 
-    # ---------- 3. Ключ + PKCS#10 ----------
+    # ---------- 3. Уже выпущен этим CA? ----------
+    if (-not $Force -and (Test-ExistingCert $storeLocation $cn $eku $root)) {
+        Write-Log 'действующий сертификат уже есть — выход'
+        exit 0
+    }
+
+    # ---------- 4. Ключ + PKCS#10 ----------
     $rsa = [System.Security.Cryptography.RSA]::Create(2048)
     $req = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest(
         "CN=$cn", $rsa,
