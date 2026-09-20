@@ -112,8 +112,9 @@ jobs:
               Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
           $deps | ForEach-Object { Write-Host "  $_" }
 
+          # api-ms-win-* — API-сеты ОС: файлов на диске может не быть, они всё равно системные.
           $system = (Get-ChildItem 'C:\Windows\System32' -Filter '*.dll' | Select-Object -ExpandProperty Name)
-          $bad = $deps | Where-Object { $_ -notin $system }
+          $bad = $deps | Where-Object { $_ -notin $system -and $_ -notlike 'api-ms-win-*' }
           if ($bad) {
             Write-Host "::error title=агент зависит от внешних DLL::$($bad -join ', ') — отключите зависимость LibVNCServer или положите DLL рядом с агентом"
             exit 1
