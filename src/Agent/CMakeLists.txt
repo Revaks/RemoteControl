@@ -6,6 +6,18 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
+# LibVNCServer ищет внешние библиотеки (OpenSSL, GnuTLS, SASL, zlib, jpeg, png, ssh2...).
+# Если на машине сборки они найдутся, агент получит зависимость от чужих DLL — и на целевой
+# машине служба не стартует (MSI: Error 1920). Агенту это не нужно: наружный TLS делает
+# Schannel, а консоль использует Raw/CopyRect/Hextile. Поэтому фиксируем всё выключенным —
+# сборка одинаковая на любой машине.
+foreach(_vnc_opt
+        WITH_OPENSSL WITH_GNUTLS WITH_GCRYPT WITH_SASL WITH_LIBSSH2 WITH_WEBSOCKETS
+        WITH_ZLIB WITH_LZO WITH_JPEG WITH_PNG WITH_SDL WITH_GTK WITH_SYSTEMD
+        WITH_FFMPEG WITH_TESTS WITH_EXAMPLES)
+    set(${_vnc_opt} OFF CACHE BOOL "off: агент не использует внешние зависимости LibVNCServer" FORCE)
+endforeach()
+
 # LibVNCServer (LGPL-2.1). Можно указать локальный исходник:
 #   cmake -DLIBVNCSERVER_DIR=third_party/libvncserver ...
 # иначе подтянется из GitHub (тег LibVNCServer-0.9.14).

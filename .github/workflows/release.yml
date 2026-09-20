@@ -97,6 +97,29 @@ jobs:
 
           Get-Item build/agent/RemoteControlAgent.exe | ForEach-Object { "агент: $($_.FullName) ($($_.Length) байт)" }
 
+      # Агент не должен тянуть чужие DLL (например, libcrypto-3-x64.dll из OpenSSL):
+      # их нет на целевой машине, служба не стартует и MSI падает с Error 1920.
+      - name: Verify agent has no foreign DLL dependencies
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like '*Hostx64\x64*' } | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin не найден' }
+
+          $deps = (& $dumpbin.FullName /dependents 'build/agent/RemoteControlAgent.exe') |
+              Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          $deps | ForEach-Object { Write-Host "  $_" }
+
+          $system = (Get-ChildItem 'C:\Windows\System32' -Filter '*.dll' | Select-Object -ExpandProperty Name)
+          $bad = $deps | Where-Object { $_ -notin $system }
+          if ($bad) {
+            Write-Host "::error title=агент зависит от внешних DLL::$($bad -join ', ') — отключите зависимость LibVNCServer или положите DLL рядом с агентом"
+            exit 1
+          }
+          Write-Host 'зависимости в порядке: только системные DLL'
+
       - name: Publish viewer (legacy packages)
         shell: pwsh
         continue-on-error: true

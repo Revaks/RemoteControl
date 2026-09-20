@@ -11,7 +11,7 @@
 
   <Package Name="Remote Control"
            Manufacturer="Revaks"
-           Version="1.2.2.0"
+           Version="1.2.3.0"
            UpgradeCode="5E7C9A21-3B4D-4F68-9C2A-7D1E5B8F3A90"
            Scope="perMachine"
            Compressed="yes"
