@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI-установщик агента Remote Control.
+  Устанавливает RemoteControlAgent.exe как службу Windows (LocalSystem, автостарт),
+  открывает порт 5900 в брандмауэре.
+
+  Сборка (см. installer/build-msi.ps1):
+    wix build RemoteControlAgent.wxs -ext WixToolset.Firewall.wixext -o RemoteControlAgent.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="Remote Control Agent"
+           Manufacturer="Revaks"
+           Version="1.0.0.0"
+           UpgradeCode="6DCCCA7F-4E43-4432-929B-A6459462096F"
+           Scope="perMachine"
+           Compressed="yes"
+           Codepage="1251">
+
+    <SummaryInformation Description="Remote Control Agent (служба удалённого управления, mTLS + AD)" />
+
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия Remote Control Agent." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch
+      Condition="Installed OR VersionNT64"
+      Message="Remote Control Agent требует 64-битную Windows." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RemoteControl" />
+    </StandardDirectory>
+
+    <Feature Id="Agent" Title="Remote Control Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+    </Feature>
+  </Package>
+
+  <!-- Файлы агента + регистрация службы -->
+  <Fragment>
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+    <Component Id="AgentServiceComponent" Guid="33592D57-A189-421E-849C-A6FF6971EF3B">
+      <File Id="AgentExe"
+            Source="RemoteControlAgent.exe"
+            KeyPath="yes" />
+
+      <ServiceInstall Id="AgentServiceInstall"
+                      Name="RemoteControlAgent"
+                      DisplayName="Remote Control Agent"
+                      Description="Агент удалённого управления: mTLS, авторизация по группе AD, RFB."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Account="LocalSystem"
+                      Vital="yes" />
+
+      <ServiceControl Id="AgentServiceControl"
+                      Name="RemoteControlAgent"
+                      Start="install"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes" />
+
+      <!-- Порт агента: TCP 5900 -->
+      <fw:FirewallException Id="AgentFirewall"
+                            Name="Remote Control Agent (TCP 5900)"
+                            Description="Входящие подключения оператора к агенту удалённого управления."
+                            Port="5900"
+                            Protocol="tcp"
+                            Scope="any"
+                            IgnoreFailure="yes" />
+
+      <RegistryValue Root="HKLM"
+                     Key="Software\Revaks\RemoteControlAgent"
+                     Name="InstallDir"
+                     Type="string"
+                     Value="[INSTALLFOLDER]"
+                     KeyPath="no" />
+    </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI-установщик консоли оператора Remote Control (WPF, self-contained).
+  Кладёт файлы в Program Files\Remote Control Viewer, создаёт ярлыки.
+
+  Сборка (см. installer/build-msi.ps1):
+    wix build RemoteControlViewer.wxs -o RemoteControlViewer.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package Name="Remote Control Viewer"
+           Manufacturer="Revaks"
+           Version="1.0.0.0"
+           UpgradeCode="4B197019-DF47-435E-ACFB-2505557D0471"
+           Scope="perMachine"
+           Compressed="yes"
+           Codepage="1251">
+
+    <SummaryInformation Description="Консоль оператора Remote Control (mTLS, список машин из AD)" />
+
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия Remote Control Viewer." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch
+      Condition="Installed OR VersionNT64"
+      Message="Remote Control Viewer требует 64-битную Windows." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Remote Control Viewer" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="Remote Control" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Viewer" Title="Remote Control Viewer" Level="1">
+      <ComponentGroupRef Id="ViewerPayload" />
+      <ComponentRef Id="ViewerShortcutsComponent" />
+    </Feature>
+  </Package>
+
+  <!-- Все файлы self-contained публикации (включая главный exe) -->
+  <Fragment>
+    <ComponentGroup Id="ViewerPayload" Directory="INSTALLFOLDER">
+      <Files Include="payload\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Ярлыки: Start Menu + рабочий стол -->
+  <Fragment>
+    <Component Id="ViewerShortcutsComponent" Directory="INSTALLFOLDER" Guid="F361B546-D09A-4190-A4E5-61E2D4CE9C0B">
+      <RegistryValue Root="HKLM"
+                     Key="Software\Revaks\RemoteControlViewer"
+                     Name="InstallDir"
+                     Type="string"
+                     Value="[INSTALLFOLDER]"
+                     KeyPath="yes" />
+
+      <Shortcut Id="StartMenuShortcut"
+                Directory="AppShortcutFolder"
+                Name="Remote Control Viewer"
+                Description="Консоль оператора Remote Control"
+                Target="[INSTALLFOLDER]RemoteControl.Viewer.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+
+      <Shortcut Id="DesktopShortcut"
+                Directory="DesktopFolder"
+                Name="Remote Control Viewer"
+                Description="Консоль оператора Remote Control"
+                Target="[INSTALLFOLDER]RemoteControl.Viewer.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+    </Component>
+  </Fragment>
+</Wix>

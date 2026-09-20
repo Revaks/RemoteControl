@@ -36,3 +36,8 @@ cmake_install.cmake
 *.key
 *.crt.local
 certs/
+
+# Installer staging (payload и exe собираются скриптом, в git не нужны)
+installer/viewer/payload/
+installer/agent/RemoteControlAgent.exe
+*.msi

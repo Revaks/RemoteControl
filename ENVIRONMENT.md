@@ -122,7 +122,7 @@ sc.exe stop RemoteControlAgent; sc.exe start RemoteControlAgent
 - CDP кодируется вручную как `30 { 30 { A0 { A0 { 86 url } } } }`
 - UPN SAN: `A0 { OID 1.3.6.1.4.1.311.20.2.3, A0 { UTF8String } }` — **без** внутреннего SEQUENCE
 - CRL: `CertificateRevocationListBuilder.Build(issuer, generator, crlNumber, nextUpdate, hashAlgorithm, aki, thisUpdate)` — обрати внимание на порядок аргументов
-- CRL URL вынесен в отдельный файл `lab-root2.crl`, чтобы не попадать в кэш CryptnetUrlCache от старых CRL
+- CRL URL вынесен в отдельный файл `lab-root3.crl`, чтобы не попадать в кэш CryptnetUrlCache от старых CRL
 
 ---
 
@@ -313,7 +313,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Setup\allevents.ps1
 virsh -c qemu:///system list --all
 
 # 2. Проверить CRL-сервер (если не работает — поднять, см. раздел 3)
-curl -s -o /dev/null -w '%{http_code}' http://192.168.122.1:8080/lab-root2.crl
+curl -s -o /dev/null -w '%{http_code}' http://192.168.122.1:8080/lab-root3.crl
 
 # 3. Проверить службу агента на VM
 sshpass -p 'LabAdmin!2026' ssh -o StrictHostKeyChecking=no Administrator@192.168.122.10 "sc.exe query RemoteControlAgent"
@@ -322,3 +322,67 @@ sshpass -p 'LabAdmin!2026' ssh -o StrictHostKeyChecking=no Administrator@192.168
 # 5. Запустить viewer на VM
 sshpass -p 'LabAdmin!2026' ssh -o StrictHostKeyChecking=no Administrator@192.168.122.10 "schtasks /run /tn 'RemoteControlViewer'"
 ```
+
+---
+
+## 12. MSI-установщики (WiX)
+
+Собираются из `installer/` — два пакета:
+
+| MSI | Что ставит | Размер |
+|---|---|---|
+| `RemoteControlAgent.msi` | `RemoteControlAgent.exe` в `C:\Program Files\RemoteControl`, службу `RemoteControlAgent` (LocalSystem, автостарт), правило брандмауэра TCP 5900 | ~0.3 МБ |
+| `RemoteControlViewer.msi` | консоль оператора (self-contained) в `C:\Program Files\Remote Control Viewer`, ярлыки в Start Menu и на рабочем столе | ~57 МБ |
+
+### Требования к сборочной машине
+
+```powershell
+# WiX v5 (v6+ требует платную OSMF-подписку)
+dotnet tool install --global wix --version 5.0.2
+wix extension add --global WixToolset.Firewall.wixext/5.0.2
+```
+
+На этой VM .NET стоит в `C:\dotnet` без регистрации в реестре — обязательно `$env:DOTNET_ROOT='C:\dotnet'`, иначе apphost WiX не стартует.
+
+### Сборка
+
+```powershell
+$env:DOTNET_ROOT='C:\dotnet'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Projects\RemoteControl\installer\build-msi.ps1
+```
+
+Результат: `C:\Projects\RemoteControl\dist\msi\*.msi`.
+
+Скрипт сам: копирует exe агента в `installer\agent\`, публикацию консоли — в `installer\viewer\payload\`, и запускает `wix build -arch x64`.
+
+### Установка / удаление
+
+```powershell
+msiexec /i C:\Projects\RemoteControl\dist\msi\RemoteControlAgent.msi /qn /l*v C:\Setup\msi-agent.log
+msiexec /i C:\Projects\RemoteControl\dist\msi\RemoteControlViewer.msi /qn /l*v C:\Setup\msi-viewer.log
+
+# удаление
+msiexec /x C:\Projects\RemoteControl\dist\msi\RemoteControlAgent.msi /qn
+msiexec /x C:\Projects\RemoteControl\dist\msi\RemoteControlViewer.msi /qn
+```
+
+Проверка после установки агента:
+
+```powershell
+sc.exe query RemoteControlAgent                       # STATE: RUNNING
+Test-Path 'C:\Program Files\RemoteControl\RemoteControlAgent.exe'   # True
+netsh advfirewall firewall show rule name="Remote Control Agent (TCP 5900)"
+```
+
+MSI агента **заменяет** ручную установку из `redeploy2.ps1`: перед первым `msiexec /i` удали ручную службу (`sc.exe stop/delete RemoteControlAgent`), иначе возможен конфликт за имя службы.
+
+Важные детали разметки (грабли, на которые уже наступили):
+
+- `ComponentGroup`/`Component` в WiX v4+ должны лежать внутри `<Fragment>` — иначе `WIX0005`.
+- `RegistryValue` не поддерживает атрибут `Bitness` (в отличие от v3) — `WIX0004`.
+- Кодировка: `Codepage="1251"` в `<Package>`, иначе кириллица в строках даёт `WIX0311` (CP 1252).
+- Обязателен `-arch x64`, иначе пакет собирается как 32-битный и ставится в `C:\Program Files (x86)`.
+- Condition 64-битности: `Installed OR VersionNT64` (без `NOT`), иначе установка падает с 1603.
+- `<Files Include="payload\**" />` требует cwd = каталог с `payload` (в скрипте используется `Set-Location`), опции `-bindpath` в v5 нет.
+- Скрипты `.ps1` с кириллицей сохранять **в UTF-8 с BOM**, иначе PowerShell 5.1 не парсит файл.
+
