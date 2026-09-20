@@ -42,8 +42,30 @@ jobs:
       - name: Build agent (CMake + MSVC)
         shell: pwsh
         run: |
-          cmake -S src/Agent -B build/agent -A x64
-          cmake --build build/agent --config Release
+          cmake --version | Select-Object -First 1
+          Write-Host "::notice::cmake $((cmake --version | Select-Object -First 1))"
+
+          cmake -S src/Agent -B build/agent -A x64 2>&1 | Tee-Object -FilePath cfg1.log
+          $ok = ($LASTEXITCODE -eq 0)
+          if (-not $ok) {
+            # CMake 4.x убрал совместимость с cmake_minimum_required < 3.5 (LibVNCServer 0.9.14).
+            Write-Host '::warning::первый configure упал, повторяю с CMAKE_POLICY_VERSION_MINIMUM=3.5'
+            Remove-Item build/agent -Recurse -Force -ErrorAction SilentlyContinue
+            cmake -S src/Agent -B build/agent -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
+            $ok = ($LASTEXITCODE -eq 0)
+          }
+          if (-not $ok) {
+            $tail = ((Get-Content cfg2.log -Tail 20) -join '%0A')
+            Write-Host "::error title=cmake configure failed::$tail"
+            exit 1
+          }
+
+          cmake --build build/agent --config Release 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = ((Get-Content build.log -Tail 20) -join '%0A')
+            Write-Host "::error title=agent build failed::$tail"
+            exit 1
+          }
 
       - name: Publish viewer (legacy packages)
         shell: pwsh
@@ -55,7 +77,12 @@ jobs:
       - name: Build single MSI (agent + CA + viewer)
         shell: pwsh
         run: |
-          ./installer/build-single-msi.ps1
+          ./installer/build-single-msi.ps1 2>&1 | Tee-Object -FilePath msi.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = ((Get-Content msi.log -Tail 20) -join '%0A')
+            Write-Host "::error title=MSI build failed::$tail"
+            exit 1
+          }
 
       - name: Build legacy MSIs (optional)
         shell: pwsh
