@@ -230,6 +230,49 @@ RUNNING, `/health` = ok, машинный сертификат `CN=WIN11HOST.cor
 `RemoteControl.msi` (68.7 МБ) + legacy `RemoteControlAgent.msi`/`RemoteControlViewer.msi`;
 скачанный MSI — валидный (WiX 5.0.2, x64, `ProductName=Remote Control`).
 
+### 5.2.2. Грабли установки на DC, push-режима и обновлений (1.2.3–1.2.5)
+
+**Агент не должен тянуть чужие DLL.** CI-раннер нашёл OpenSSL, LibVNCServer слинковался с ним,
+и агент получил зависимость от `libcrypto-3-x64.dll`. На целевой машине её нет → процесс не
+стартует, SCM ждёт 30 с и MSI падает с **Error 1920** (и откатывается). Проверять:
+`dumpbin /dependents RemoteControlAgent.exe`. Лечение: в `src/Agent/CMakeLists.txt`
+все внешние опции LibVNCServer (`WITH_OPENSSL/WITH_GNUTLS/WITH_GCRYPT/WITH_SASL/WITH_LIBSSH2/
+WITH_WEBSOCKETS/WITH_ZLIB/WITH_LZO/WITH_JPEG/WITH_PNG/...`) принудительно `OFF` — агенту они
+не нужны (наружный TLS делает Schannel, консоль использует Raw/CopyRect/Hextile). В CI есть шаг
+проверки, который падает, если в зависимостях появилась не-системная DLL (`api-ms-win-*` — системные).
+
+**У автономных ЦС одинаковый subject.** `CN=RemoteControl Lab CA` у каждого сервера, поэтому
+`enroll-cert.ps1` не может отличить «свой» ЦС от чужого сравнением строки Issuer: сертификат,
+выпущенный ЦС другой машины, считался своим, и выпуск пропускался («действующий сертификат уже
+есть»). Теперь ЦС опознаётся по ключу: AKI сертификата (`2.5.29.35`) сравнивается со SKI корня
+(`2.5.29.14`), а корень берётся с `-CaUrl` (делается до проверки «уже есть»; работает и в PS 5.1,
+где нет `X509ChainTrustMode`).
+
+**`Add` в `CurrentUser\Root` может бросить исключение.** На DC1 `X509Store.Add` вернул
+«The request is not supported», хотя сертификат фактически добавился. Теперь результат
+проверяется наличием сертификата в хранилище, а не отсутствием исключения.
+
+**Major upgrade: старый продукт удалять ДО установки нового.** При обновлении WIN11HOST
+1.2.2 → 1.2.4 каталог `ca\` похудел с 187 файлов до 6 (пропал self-contained рантайм .NET) и ЦС
+не запускался («Failed to resolve hostfxr.dll»). Причина — расписание по умолчанию
+(`afterInstallFinalize`): новый продукт ставится, а затем удаление старого сносит только что
+записанные файлы с теми же путями. В `installer/RemoteControl.wxs`:
+`<MajorUpgrade Schedule="afterInstallValidate" .../>`.
+
+**Push-режим временный.** `PushSession.CleanupAsync` (= `DisposeAsync`) делает
+`RemoteServiceManager.StopAndDelete()` и удаляет `admin$\Temp\RemoteControlAgent.exe`. Поэтому
+после сеанса push-агента служба исчезает — именно так «пропали» службы на DC1 и WIN11HOST
+(удаление службы уносит и ветку `...\Services\RemoteControlAgent\Parameters`). У MSI-установки
+это оставляет рассинхрон: продукт в «Установка приложений» есть, а службы нет — лечится
+переустановкой. Push ставит агент в `C:\Windows\Temp`, MSI — в `Program Files`.
+
+**Проверено 20.09.2026 (DC1, MSI 1.2.4/1.2.5):** DC1 (контроллер домена) с установленным MSI
+развернул агент на WIN11HOST тем же кодом, что использует консоль
+(`PushSession.DeployAsync` → `TlsTransport.ConnectAsync` → `RfbClient`): служба создалась и
+запустилась, TLS 1.2 (`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`), кадр 1280x800, после сеанса
+push убрал службу и файл.
+
+
 
 ---
 
