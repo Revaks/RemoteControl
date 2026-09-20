@@ -39,31 +39,57 @@ jobs:
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add --global WixToolset.Firewall.wixext/5.0.2
 
+      # На раннере CMake 4.x, а LibVNCServer 0.9.14 под него не конфигурируется
+      # (CMake 4 убрал совместимость с cmake_minimum_required < 3.5).
+      - name: Pin CMake 3.x
+        shell: pwsh
+        run: |
+          python -m pip install --quiet --disable-pip-version-check "cmake==3.29.6"
+          $scripts = (python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+          $exe = Join-Path $scripts 'cmake.exe'
+          if (-not (Test-Path $exe)) { throw "cmake не найден: $exe" }
+          "CMAKE_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $exe --version | Select-Object -First 1
+
       - name: Build agent (CMake + MSVC)
         shell: pwsh
         run: |
-          cmake --version | Select-Object -First 1
-          Write-Host "::notice::cmake $((cmake --version | Select-Object -First 1))"
+          & $env:CMAKE_EXE --version | Select-Object -First 1
 
-          cmake -S src/Agent -B build/agent -A x64 2>&1 | Tee-Object -FilePath cfg1.log
+          # Собираем хвост ошибки так, чтобы в аннотацию попал текст CMake Error, а не только
+          # последние строки про проверки типов.
+          function Get-ErrTail([string]$Path) {
+            if (-not (Test-Path $Path)) { return '' }
+            $err = (Select-String -Path $Path -Pattern 'CMake Error' -Context 0, 10 |
+                    Select-Object -First 2 |
+                    ForEach-Object { @($_.Line) + @($_.Context.PostContext) }) -join '%0A'
+            if (-not $err) { $err = ((Get-Content $Path -Tail 25) -join '%0A') }
+            return $err
+          }
+
+          & $env:CMAKE_EXE -S src/Agent -B build/agent -A x64 2>&1 | Tee-Object -FilePath cfg1.log
           $ok = ($LASTEXITCODE -eq 0)
           if (-not $ok) {
             # CMake 4.x убрал совместимость с cmake_minimum_required < 3.5 (LibVNCServer 0.9.14).
             Write-Host '::warning::первый configure упал, повторяю с CMAKE_POLICY_VERSION_MINIMUM=3.5'
             Remove-Item build/agent -Recurse -Force -ErrorAction SilentlyContinue
-            cmake -S src/Agent -B build/agent -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
+            & $env:CMAKE_EXE -S src/Agent -B build/agent -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | Tee-Object -FilePath cfg2.log
             $ok = ($LASTEXITCODE -eq 0)
           }
           if (-not $ok) {
-            $tail = ((Get-Content cfg2.log -Tail 20) -join '%0A')
+            $tail = Get-ErrTail 'cfg2.log'
+            if (-not $tail) { $tail = Get-ErrTail 'cfg1.log' }
             Write-Host "::error title=cmake configure failed::$tail"
             exit 1
           }
 
-          cmake --build build/agent --config Release 2>&1 | Tee-Object -FilePath build.log
+          & $env:CMAKE_EXE --build build/agent --config Release 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
-            $tail = ((Get-Content build.log -Tail 20) -join '%0A')
-            Write-Host "::error title=agent build failed::$tail"
+            $err = (Select-String -Path build.log -Pattern 'error C|error MSB|fatal error' -Context 0, 2 |
+                    Select-Object -First 4 |
+                    ForEach-Object { @($_.Line) + @($_.Context.PostContext) }) -join '%0A'
+            if (-not $err) { $err = ((Get-Content build.log -Tail 25) -join '%0A') }
+            Write-Host "::error title=agent build failed::$err"
             exit 1
           }
 
